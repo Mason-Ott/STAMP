@@ -233,6 +233,11 @@ def extract_(
             from stamp.preprocessing.extractor.empty import empty
 
             extractor = empty()
+        
+        case ExtractorName.RESNET50:
+            from stamp.preprocessing.extractor.resnet50 import resnet50
+
+            extractor = resnet50()
 
         case Extractor():
             extractor = extractor
@@ -320,11 +325,13 @@ def extract_(
             )
 
             feats, xs_um, ys_um = [], [], []
+
             for tiles, xs, ys in tqdm(dl, leave=False):
                 with torch.inference_mode():
                     feats.append(model(tiles.to(device)).detach().half().cpu())
                 xs_um.append(xs.float())
                 ys_um.append(ys.float())
+                
         except MPPExtractionError:
             _logger.exception(
                 "failed to extract MPP from slide. "

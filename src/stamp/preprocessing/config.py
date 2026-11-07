@@ -17,20 +17,11 @@ class ExtractorName(StrEnum):
     CONCH1_5 = "conch1_5"
     UNI = "uni"
     UNI2 = "uni2"
-    DINO_BLOOM = "dino-bloom"
     GIGAPATH = "gigapath"
-    H_OPTIMUS_0 = "h-optimus-0"
-    H_OPTIMUS_1 = "h-optimus-1"
     VIRCHOW = "virchow"
     VIRCHOW_FULL = "virchow-full"
     VIRCHOW2 = "virchow2"
-    MUSK = "musk"
-    MSTAR = "mstar"
-    PLIP = "plip"
-    KEEP = "keep"
-    TICON = "ticon"
-    EMPTY = "empty"
-    RED_DINO = "red-dino"
+    RESNET50 = "resnet50"
 
 
 class PreprocessingConfig(BaseModel, arbitrary_types_allowed=True):
