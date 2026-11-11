@@ -155,7 +155,7 @@ cpu = [
 gpu = [
     "torch==2.11.0",
     "torchvision==0.26.0",
-    "stamp[conch,ctranspath,uni,virchow2,chief_ctranspath,conch1_5_cpu,prism,madeleine,plip,musk_cpu,cobra]"
+    "stamp[conch,ctranspath,uni,virchow2,chief_ctranspath,conch1_5_cpu,prism,madeleine,plip,musk_cpu]"
 ]
 gpu_all = [
     "torch==2.11.0",

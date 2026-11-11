@@ -214,52 +214,6 @@ def _run_cli(args: argparse.Namespace) -> None:
                 advanced=config.advanced_config,
             )
 
-        case "statistics":
-            from stamp.statistics import compute_stats_
-
-            if config.statistics is None:
-                raise ValueError("no statistics configuration supplied")
-
-            _add_file_handle_(_logger, output_dir=config.statistics.output_dir)
-            _logger.info(
-                "using the following configuration:\n"
-                f"{yaml.dump(config.statistics.model_dump(mode='json', exclude_none=True))}"
-            )
-
-            compute_stats_(
-                task=config.statistics.task,
-                output_dir=config.statistics.output_dir,
-                pred_csvs=config.statistics.pred_csvs,
-                ground_truth_label=config.statistics.ground_truth_label,
-                true_class=config.statistics.true_class,
-                time_label=config.statistics.time_label,
-                status_label=config.statistics.status_label,
-            )
-
-        case "heatmaps":
-            from stamp.heatmaps import heatmaps_
-
-            if config.heatmaps is None:
-                raise ValueError("no heatmaps configuration supplied")
-
-            _add_file_handle_(_logger, output_dir=config.heatmaps.output_dir)
-            _logger.info(
-                "using the following configuration:\n"
-                f"{yaml.dump(config.heatmaps.model_dump(mode='json'))}"
-            )
-            heatmaps_(
-                feature_dir=config.heatmaps.feature_dir,
-                wsi_dir=config.heatmaps.wsi_dir,
-                checkpoint_path=config.heatmaps.checkpoint_path,
-                output_dir=config.heatmaps.output_dir,
-                slide_paths=config.heatmaps.slide_paths,
-                device=config.heatmaps.device,
-                topk=config.heatmaps.topk,
-                bottomk=config.heatmaps.bottomk,
-                default_slide_mpp=config.heatmaps.default_slide_mpp,
-                opacity=config.heatmaps.opacity,
-            )
-
         case _:
             raise RuntimeError(
                 "unreachable: the argparser should only allow valid commands"

@@ -177,12 +177,7 @@ positional arguments:
     preprocess          Preprocess whole-slide images into feature vectors
     encode_slides       Encode patch-level features into slide-level embeddings
     encode_patients     Encode features into patient-level embeddings
-    train               Train a Vision Transformer model
-    crossval            Train a Vision Transformer model with cross validation for modeling.n_splits folds
-    deploy              Deploy a trained Vision Transformer model
-    statistics          Generate AUROCs and AUPRCs with 95%CI for a trained Vision Transformer model
     config              Print the loaded configuration
-    heatmaps            Generate heatmaps for a trained model
 
 options:
   -h, --help            show this help message and exit

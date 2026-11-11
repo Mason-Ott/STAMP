@@ -1,7 +1,6 @@
 # %%
 from pathlib import Path
 
-from stamp.heatmaps.config import HeatmapConfig
 from stamp.modeling.config import (
     AdvancedConfig,
     CrossvalConfig,
@@ -19,57 +18,12 @@ from stamp.preprocessing.config import (
     SlideMPP,
     TilePixels,
 )
-from stamp.statistics import StatsConfig
 from stamp.utils.config import StampConfig
 
 
 def test_config_parsing() -> None:
     config = StampConfig.model_validate(
         {
-            "crossval": {
-                "task": "classification",
-                "categories": None,
-                "clini_table": "clini.xlsx",
-                "feature_dir": "CRC",
-                "filename_label": "FILENAME",
-                "ground_truth_label": "isMSIH",
-                "time_label": "time_label",
-                "status_label": "status_label",
-                "output_dir": "test-crossval",
-                "patient_label": "PATIENT",
-                "slide_table": "slide.csv",
-                "use_vary_precision_transform": False,
-                "n_splits": 5,
-            },
-            "deployment": {
-                "checkpoint_paths": [
-                    "test-crossval/split-0/model.ckpt",
-                    "test-crossval/split-1/model.ckpt",
-                    "test-crossval/split-2/model.ckpt",
-                    "test-crossval/split-3/model.ckpt",
-                    "test-crossval/split-4/model.ckpt",
-                ],
-                "clini_table": "clini.xlsx",
-                "feature_dir": "CRC",
-                "filename_label": "FILENAME",
-                "ground_truth_label": "isMSIH",
-                "time_label": "time_label",
-                "status_label": "status_label",
-                "output_dir": "test-deploy",
-                "patient_label": "PATIENT",
-                "slide_table": "slide.csv",
-            },
-            "heatmaps": {
-                "bottomk": 5,
-                "checkpoint_path": "test-train/model.ckpt",
-                "device": "cuda",
-                "feature_dir": "feats",
-                "output_dir": "test-heatmaps",
-                "slide_paths": None,
-                "topk": 5,
-                "wsi_dir": "wsis",
-                "default_slide_mpp": 1.0,
-            },
             "preprocessing": {
                 "brightness_cutoff": 240,
                 "cache_dir": "cache",
@@ -82,33 +36,6 @@ def test_config_parsing() -> None:
                 "tile_size_um": 256.0,
                 "wsi_dir": "wsis",
                 "default_slide_mpp": 1.0,
-            },
-            "statistics": {
-                "task": "classification",
-                "ground_truth_label": "isMSIH",
-                "output_dir": "test-stats",
-                "pred_csvs": [
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-0/patient-preds.csv",
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-1/patient-preds.csv",
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-2/patient-preds.csv",
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-3/patient-preds.csv",
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-4/patient-preds.csv",
-                ],
-                "true_class": "MSIH",
-            },
-            "training": {
-                "task": "classification",
-                "categories": None,
-                "clini_table": "clini.xlsx",
-                "feature_dir": "CRC",
-                "filename_label": "FILENAME",
-                "ground_truth_label": "isMSIH",
-                "time_label": "time_label",
-                "status_label": "status_label",
-                "output_dir": "test-alibi",
-                "patient_label": "PATIENT",
-                "slide_table": "slide.csv",
-                "use_vary_precision_transform": False,
             },
             "advanced_config": {
                 "seed": 42,
@@ -149,89 +76,6 @@ def test_config_parsing() -> None:
             device="cuda",
             brightness_cutoff=240,
             canny_cutoff=0.02,
-            default_slide_mpp=SlideMPP(1.0),
-        ),
-        training=TrainConfig(
-            task="classification",
-            output_dir=Path("test-alibi"),
-            clini_table=Path("clini.xlsx"),
-            slide_table=Path("slide.csv"),
-            feature_dir=Path("CRC"),
-            ground_truth_label="isMSIH",
-            time_label="time_label",
-            status_label="status_label",
-            categories=None,
-            patient_label="PATIENT",
-            filename_label="FILENAME",
-            params_path=None,
-            use_vary_precision_transform=False,
-        ),
-        crossval=CrossvalConfig(
-            task="classification",
-            output_dir=Path("test-crossval"),
-            clini_table=Path("clini.xlsx"),
-            slide_table=Path("slide.csv"),
-            feature_dir=Path("CRC"),
-            ground_truth_label="isMSIH",
-            time_label="time_label",
-            status_label="status_label",
-            categories=None,
-            patient_label="PATIENT",
-            filename_label="FILENAME",
-            params_path=None,
-            use_vary_precision_transform=False,
-            n_splits=5,
-        ),
-        deployment=DeploymentConfig(
-            output_dir=Path("test-deploy"),
-            checkpoint_paths=[
-                Path("test-crossval/split-0/model.ckpt"),
-                Path("test-crossval/split-1/model.ckpt"),
-                Path("test-crossval/split-2/model.ckpt"),
-                Path("test-crossval/split-3/model.ckpt"),
-                Path("test-crossval/split-4/model.ckpt"),
-            ],
-            clini_table=Path("clini.xlsx"),
-            slide_table=Path("slide.csv"),
-            feature_dir=Path("CRC"),
-            ground_truth_label="isMSIH",
-            time_label="time_label",
-            status_label="status_label",
-            patient_label="PATIENT",
-            filename_label="FILENAME",
-        ),
-        statistics=StatsConfig(
-            task="classification",
-            output_dir=Path("test-stats"),
-            pred_csvs=[
-                Path(
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-0/patient-preds.csv"
-                ),
-                Path(
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-1/patient-preds.csv"
-                ),
-                Path(
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-2/patient-preds.csv"
-                ),
-                Path(
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-3/patient-preds.csv"
-                ),
-                Path(
-                    "/mnt/bulk-neptune/mvantreeck/stamp2/test-crossval/split-4/patient-preds.csv"
-                ),
-            ],
-            ground_truth_label="isMSIH",
-            true_class="MSIH",
-        ),
-        heatmaps=HeatmapConfig(
-            output_dir=Path("test-heatmaps"),
-            feature_dir=Path("feats"),
-            wsi_dir=Path("wsis"),
-            checkpoint_path=Path("test-train/model.ckpt"),
-            slide_paths=None,
-            device="cuda",
-            topk=5,
-            bottomk=5,
             default_slide_mpp=SlideMPP(1.0),
         ),
         advanced_config=AdvancedConfig(
