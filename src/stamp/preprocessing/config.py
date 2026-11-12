@@ -44,6 +44,16 @@ class PreprocessingConfig(BaseModel, arbitrary_types_allowed=True):
         )
     )
     generate_hash: bool = True
+    
+    save_visualisations: bool = Field(
+        default=False,
+        description="Save WSI overview images showing successfully extracted tiles.",
+    )
+    visualisation_max_dimension: int = Field(
+        default=4000,
+        gt=0,
+        description="Maximum width or height of generated overview images in pixels.",
+    )
 
     default_slide_mpp: SlideMPP | None = None
     """MPP of the slide to use if none can be inferred from the WSI"""

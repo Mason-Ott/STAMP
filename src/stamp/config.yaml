@@ -11,7 +11,8 @@ preprocessing:
   tile_size_px: 224
 
   max_workers: 8
-  brightness_cutoff: 240
+  save_visualisations: true
+  visualisation_max_dimension: 4000
 
   # The extension of the tiles to cache. Use "png" for lossless compression,
   # or "jpg" for lossy compression (requires around x100 less memory, 

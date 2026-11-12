@@ -10,10 +10,11 @@ import numpy.typing as npt
 import openslide
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
+
 
 import stamp
 from stamp.preprocessing.config import ExtractorName
@@ -123,6 +124,8 @@ def extract_(
     brightness_cutoff: int | None,
     canny_cutoff: float | None,
     generate_hash: bool,
+    save_visualisations: bool = False,
+    visualisation_max_dimension: int = 4000,
 ) -> None:
     """
     Extracts features from slides.
@@ -171,9 +174,9 @@ def extract_(
             extractor = dino_bloom()
 
         case ExtractorName.RED_DINO:
-            from stamp.preprocessing.extractor.reddino import red_dino
+            from stamp.preprocessing.extractor.reddino import reddino
 
-            extractor = red_dino()
+            extractor = reddino()
 
         case ExtractorName.VIRCHOW:
             from stamp.preprocessing.extractor.virchow import virchow
@@ -224,6 +227,7 @@ def extract_(
             from stamp.preprocessing.extractor.keep import keep
 
             extractor = keep()
+
         case ExtractorName.TICON:
             from stamp.preprocessing.extractor.ticon import ticon
 
@@ -233,7 +237,7 @@ def extract_(
             from stamp.preprocessing.extractor.empty import empty
 
             extractor = empty()
-        
+
         case ExtractorName.RESNET50:
             from stamp.preprocessing.extractor.resnet50 import resnet50
 
@@ -248,7 +252,6 @@ def extract_(
     model = extractor.model.to(device).eval()
 
     code_hash = get_processing_code_hash(Path(__file__))[:8]
-
     extractor_id = extractor.identifier
 
     _logger.info(f"Using extractor {extractor.identifier}")
@@ -271,20 +274,48 @@ def extract_(
             p for ext in supported_extensions for p in wsi_dir.glob(f"**/*{ext}")
         ]
 
-    # We shuffle so if we run multiple jobs on multiple computers at the same time,
-    # They won't interfere with each other too much
-    rng = np.random.default_rng()  # system entropy
+    # Shuffle slides to reduce interference between concurrent jobs.
+    rng = np.random.default_rng()
     perm = rng.permutation(len(slide_paths))
     slide_paths = [slide_paths[i] for i in perm]
 
     for slide_path in (progress := tqdm(slide_paths)):
-        progress.set_description(str(slide_path.relative_to(wsi_dir)))
+        relative_slide_path = slide_path.relative_to(wsi_dir)
+        progress.set_description(str(relative_slide_path))
         _logger.debug(f"processing {slide_path}")
 
-        feature_output_path = feat_output_dir / slide_path.relative_to(
-            wsi_dir
-        ).with_suffix(".h5")
+        feature_output_path = feat_output_dir / relative_slide_path.with_suffix(".h5")
+
+        overview_path = (
+            feat_output_dir
+            / "visualisations"
+            / relative_slide_path.with_suffix("")
+            / "overview.png"
+        )
+
+        # Reuse existing features and coordinates where possible.
         if feature_output_path.exists():
+            if save_visualisations and not overview_path.exists():
+                try:
+                    with h5py.File(feature_output_path, "r") as h5_fp:
+                        coords = h5_fp["coords"][:]
+                        saved_tile_size_um = h5_fp.attrs.get(
+                            "tile_size_um", tile_size_um
+                        )
+
+                    _save_tile_overview(
+                        slide_path,
+                        overview_path,
+                        coords_um=coords,
+                        tile_size_um=Microns(float(saved_tile_size_um)),
+                        max_dimension=visualisation_max_dimension,
+                        default_slide_mpp=default_slide_mpp,
+                    )
+                except Exception:
+                    _logger.exception(
+                        f"failed to create tile overview for {slide_path}"
+                    )
+
             _logger.debug(
                 f"skipping {slide_path} because {feature_output_path} already exists"
             )
@@ -293,14 +324,15 @@ def extract_(
         feature_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Validate MPP here once (avoids a second openslide.open_slide inside _TileDataset.__init__).
-            if (
-                get_slide_mpp_(
-                    openslide.open_slide(slide_path), default_mpp=default_slide_mpp
-                )
-                is None
-            ):
-                raise MPPExtractionError()
+            # Validate MPP before constructing the tile dataset.
+            slide = openslide.open_slide(str(slide_path))
+            try:
+                if get_slide_mpp_(
+                    slide, default_mpp=default_slide_mpp
+                ) is None:
+                    raise MPPExtractionError()
+            finally:
+                slide.close()
 
             ds = _TileDataset(
                 slide_path=slide_path,
@@ -315,8 +347,8 @@ def extract_(
                 canny_cutoff=canny_cutoff,
                 default_slide_mpp=default_slide_mpp,
             )
-            # Parallelism is implemented in the dataset iterator already, so one worker is enough!
-            # num_workers=1 is intentional: WSI read parallelism is inside _supertiles.
+
+            # Parallelism is implemented in the dataset iterator already.
             dl = DataLoader(
                 ds,
                 batch_size=64,
@@ -329,15 +361,18 @@ def extract_(
             for tiles, xs, ys in tqdm(dl, leave=False):
                 with torch.inference_mode():
                     feats.append(model(tiles.to(device)).detach().half().cpu())
+
                 xs_um.append(xs.float())
                 ys_um.append(ys.float())
-                
+
         except MPPExtractionError:
             _logger.exception(
                 "failed to extract MPP from slide. "
-                "You can try manually setting it by adding `preprocessing.default_slide_mpp = <MPP>` "
+                "You can try manually setting it by adding "
+                "`preprocessing.default_slide_mpp = <MPP>` "
             )
             continue
+
         except Exception:
             _logger.exception(f"error while extracting features from {slide_path}")
             continue
@@ -346,9 +381,11 @@ def extract_(
             _logger.info(f"no tiles found in {slide_path}, skipping")
             continue
 
-        coords = torch.stack([torch.concat(xs_um), torch.concat(ys_um)], dim=1).numpy()
+        coords = torch.stack(
+            [torch.concat(xs_um), torch.concat(ys_um)], dim=1
+        ).numpy()
 
-        # Save the file under an intermediate name to prevent half-written files
+        # Save features and coordinates under an intermediate filename.
         with (
             NamedTemporaryFile(dir=output_dir, delete=False) as tmp_h5_file,
             h5py.File(tmp_h5_file, "w") as h5_fp,
@@ -360,24 +397,39 @@ def extract_(
                 h5_fp.attrs["stamp_version"] = stamp.__version__
                 h5_fp.attrs["extractor"] = str(extractor.identifier)
                 h5_fp.attrs["unit"] = "um"
-                h5_fp.attrs["tile_size_um"] = tile_size_um  # changed in v2.1.0
+                h5_fp.attrs["tile_size_um"] = tile_size_um
                 h5_fp.attrs["tile_size_px"] = tile_size_px
                 h5_fp.attrs["code_hash"] = code_hash
                 h5_fp.attrs["feat_type"] = "tile"
+
             except Exception:
                 _logger.exception(f"error while writing {feature_output_path}")
-                if tmp_h5_file is not None:
-                    Path(tmp_h5_file.name).unlink(missing_ok=True)
+                Path(tmp_h5_file.name).unlink(missing_ok=True)
                 continue
 
             Path(tmp_h5_file.name).rename(feature_output_path)
             _logger.debug(f"saved features to {feature_output_path}")
 
-        # Save rejection thumbnail
-        thumbnail_path = feat_output_dir / slide_path.relative_to(wsi_dir).with_suffix(
-            ".jpg"
-        )
+        # Generate the accepted-tile overview.
+        if save_visualisations:
+            try:
+                _save_tile_overview(
+                    slide_path,
+                    overview_path,
+                    coords_um=coords,
+                    tile_size_um=tile_size_um,
+                    max_dimension=visualisation_max_dimension,
+                    default_slide_mpp=default_slide_mpp,
+                )
+            except Exception:
+                _logger.exception(
+                    f"failed to create tile overview for {slide_path}"
+                )
+
+        # Save the existing rejection thumbnail unchanged.
+        thumbnail_path = feat_output_dir / relative_slide_path.with_suffix(".jpg")
         thumbnail_path.parent.mkdir(exist_ok=True, parents=True)
+
         _get_rejection_thumb(
             openslide.open_slide(str(slide_path)),
             size=(512, 512),
@@ -422,6 +474,62 @@ def _get_rejection_thumb(
     thumb.paste(discarded_im, mask=discarded_im)
     return thumb
 
+
+def _save_tile_overview(
+    slide_path: Path,
+    output_path: Path,
+    *,
+    coords_um: npt.NDArray,
+    tile_size_um: Microns,
+    max_dimension: int,
+    default_slide_mpp: SlideMPP | None,
+) -> None:
+    """Save a WSI thumbnail with accepted tiles highlighted in red."""
+    slide = openslide.open_slide(str(slide_path))
+
+    try:
+        mpp = get_slide_mpp_(slide, default_mpp=default_slide_mpp)
+        if mpp is None:
+            raise MPPExtractionError()
+
+        thumb = slide.get_thumbnail(
+            (max_dimension, max_dimension)
+        ).convert("RGBA")
+
+        # Create a separate transparent overlay.
+        overlay = Image.new("RGBA", thumb.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        scale_x = thumb.width / slide.dimensions[0]
+        scale_y = thumb.height / slide.dimensions[1]
+
+        tile_width = (tile_size_um / mpp) * scale_x
+        tile_height = (tile_size_um / mpp) * scale_y
+
+        line_width = max(2, round(max(thumb.size) / 1500))
+
+        for x_um, y_um in coords_um:
+            x0 = (x_um / mpp) * scale_x
+            y0 = (y_um / mpp) * scale_y
+
+            x1 = x0 + tile_width
+            y1 = y0 + tile_height
+
+            draw.rectangle(
+                (x0, y0, x1, y1),
+                fill=(255, 0, 0, 60),
+                outline=(255, 0, 0, 180),
+                width=line_width,
+            )
+
+        # Blend the overlay with the original thumbnail.
+        thumb = Image.alpha_composite(thumb, overlay)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        thumb.save(output_path, format="PNG")
+
+    finally:
+        slide.close()
 
 def _get_slide_paths(wsi_list: Path) -> set[str]:
     """

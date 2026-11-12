@@ -99,6 +99,14 @@ def _run_cli(args: argparse.Namespace) -> None:
                 canny_cutoff=config.preprocessing.canny_cutoff,
                 cache_tiles_ext=config.preprocessing.cache_tiles_ext,
                 generate_hash=config.preprocessing.generate_hash,
+                save_visualisations=(
+                    config.preprocessing.save_visualisations
+                    if args.save_visualisations is None
+                    else args.save_visualisations
+                ),
+                visualisation_max_dimension=(
+                    config.preprocessing.visualisation_max_dimension
+                ),
             )
 
         case "encode_slides":
@@ -250,9 +258,28 @@ def main() -> None:
         "init",
         help="Create a new STAMP configuration file at the path specified by --config",
     )
-    commands.add_parser(
-        "preprocess", help="Preprocess whole-slide images into feature vectors"
+    preprocess_parser = commands.add_parser(
+        "preprocess",
+        help="Preprocess whole-slide images into feature vectors",
     )
+
+    visualisation_group = preprocess_parser.add_mutually_exclusive_group()
+
+    visualisation_group.add_argument(
+        "--save-visualisations",
+        dest="save_visualisations",
+        action="store_true",
+        help="Save overview images showing accepted tiles",
+    )
+
+    visualisation_group.add_argument(
+        "--no-save-visualisations",
+        dest="save_visualisations",
+        action="store_false",
+        help="Disable overview image generation",
+    )
+
+    preprocess_parser.set_defaults(save_visualisations=None)
     commands.add_parser(
         "encode_slides",
         help="Encode patch-level features into slide-level embeddings",
@@ -261,18 +288,7 @@ def main() -> None:
         "encode_patients",
         help="Encode features into patient-level embeddings",
     )
-    commands.add_parser("train", help="Train a Vision Transformer model")
-    commands.add_parser(
-        "crossval",
-        help="Train a Vision Transformer model with cross validation for modeling.n_splits folds",
-    )
-    commands.add_parser("deploy", help="Deploy a trained Vision Transformer model")
-    commands.add_parser(
-        "statistics",
-        help="Generate AUROCs and AUPRCs with 95%%CI for a trained Vision Transformer model",
-    )
     commands.add_parser("config", help="Print the loaded configuration")
-    commands.add_parser("heatmaps", help="Generate heatmaps for a trained model")
 
     args = parser.parse_args()
 
