@@ -286,12 +286,7 @@ def extract_(
 
         feature_output_path = feat_output_dir / relative_slide_path.with_suffix(".h5")
 
-        overview_path = (
-            feat_output_dir
-            / "visualisations"
-            / relative_slide_path.with_suffix("")
-            / "overview.png"
-        )
+        overview_path = feature_output_path.with_suffix(".png")
 
         # Reuse existing features and coordinates where possible.
         if feature_output_path.exists():
@@ -425,55 +420,6 @@ def extract_(
                 _logger.exception(
                     f"failed to create tile overview for {slide_path}"
                 )
-
-        # Save the existing rejection thumbnail unchanged.
-        thumbnail_path = feat_output_dir / relative_slide_path.with_suffix(".jpg")
-        thumbnail_path.parent.mkdir(exist_ok=True, parents=True)
-
-        _get_rejection_thumb(
-            openslide.open_slide(str(slide_path)),
-            size=(512, 512),
-            coords_um=coords,
-            tile_size_um=tile_size_um,
-            default_slide_mpp=default_slide_mpp,
-        ).convert("RGB").save(thumbnail_path)
-
-
-def _get_rejection_thumb(
-    slide: openslide.AbstractSlide,
-    *,
-    size: tuple[int, int],
-    coords_um: npt.NDArray,
-    tile_size_um: Microns,
-    default_slide_mpp: SlideMPP | None,
-) -> Image.Image:
-    """Creates a thumbnail of the slide"""
-
-    inclusion_map = np.zeros(
-        np.uint32(
-            np.ceil(
-                np.array(slide.dimensions)
-                * get_slide_mpp_(slide, default_mpp=default_slide_mpp)
-                / tile_size_um
-            )
-        ),
-        dtype=bool,
-    )
-
-    # Vectorized: set all tile positions at once instead of a Python loop.
-    tile_indices = np.floor(coords_um / tile_size_um).astype(np.uint32)
-    inclusion_map[tile_indices[:, 0], tile_indices[:, 1]] = True
-
-    thumb = slide.get_thumbnail(size).convert("RGBA")
-    discarded_im = Image.fromarray(
-        np.where(
-            inclusion_map.transpose()[:, :, None], [0, 0, 0, 0], [255, 0, 0, 128]
-        ).astype(np.uint8)
-    ).resize(thumb.size, resample=Image.Resampling.NEAREST)
-
-    thumb.paste(discarded_im, mask=discarded_im)
-    return thumb
-
 
 def _save_tile_overview(
     slide_path: Path,

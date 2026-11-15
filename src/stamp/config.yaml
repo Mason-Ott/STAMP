@@ -1,13 +1,13 @@
 preprocessing:
-  output_dir: "/csse/research/cancerimages/preprocess_test/conch/"
-  wsi_dir: "/csse/research/cancerimages/CRC_Dataset/wsis/"
+  output_dir: "/home/mason/masters/conch_embeddings/"
+  wsi_dir: "/home/mason/masters/wsis/"
 
   extractor: "conch"
   device: "cuda"
 
-  cache_dir: "/csse/research/cancerimages/preprocess_test/conch_cache"
+  cache_dir: "/home/mason/masters/conch_embeddings/conch_cache"
 
-  tile_size_um: 56.0
+  # tile_size_um: 56.0
   tile_size_px: 224
 
   max_workers: 8
