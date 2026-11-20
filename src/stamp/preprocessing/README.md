@@ -66,6 +66,26 @@ the STAMP tile cache are shared); adding an `encoder` redoes only encoding;
 changing tile size or cutoffs starts from the slides (the tile cache is keyed
 the same way).
 
+**Using every tile.** TITAN's memory grows quickly with the number of tiles, so
+by default the bag is capped by sampling. To use all of a patient's tiles, turn
+sampling off and chunk the encoding:
+
+```yaml
+pipeline:
+  sampling: {enabled: false}
+  encoder: titan
+  encoding: {chunk_size: 8192, seed: 0}
+```
+
+A patient with more than `chunk_size` tiles is split into random chunks of
+(nearly) equal size, each chunk is encoded, and the chunk embeddings are
+averaged, so every patient still gets one embedding of the encoder's size
+(768 for TITAN). Patients that fit in one chunk are encoded whole. With sampling
+on, it is applied first and the sampled bag is chunked. Chunked embeddings go in
+their own folder (`.../chunk8192-seed0/`) and record `n_chunks`. The tiles of a
+chunk are a random subset spread over the whole patient, so TITAN sees them at
+their usual positions with gaps between them.
+
 **Encoding needs a compatible extractor.** An `encoder` only accepts features
 from certain extractors (TITAN: `conch1_5`). With any other extractor the run
 logs a warning and skips the `encode` step; asking for `--steps encode`

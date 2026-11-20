@@ -14,6 +14,7 @@ E the extractor and S the sampling settings (e.g. `first_n-8192`, or `full`):
     sampled_positions/G/S/<patient>.h5     the sampled tile positions
     features/E/G/S/<patient>.h5            sampled tiles with features  <- training
     embeddings/<encoder>/E/G/S/<patient>.h5   one embedding per patient
+    (with encoding.chunk_size: embeddings/<encoder>/E/G/S/chunk<n>-seed<k>/)
 
 extract_then_sample uses `slide_features/E/T`, `patient_features/E/G` and
 `sampled_features/E/G/S` instead of the positions folders, and ends in the
@@ -133,6 +134,8 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
             relative = Path(
                 "embeddings", str(cfg.encoder), extractor, patient, sampling
             )
+            if cfg.encoding.tag is not None:
+                relative /= cfg.encoding.tag
         elif step == last_data_step:
             relative = Path("features", extractor, patient, sampling)
         else:
@@ -321,7 +324,9 @@ def _runners(
             encode.run,
             encoder=models.encoder,
             settings=encode.EncodingSettings(
-                device=cfg.encoder_device or str(pre.device)
+                device=cfg.encoder_device or str(pre.device),
+                chunk_size=cfg.encoding.chunk_size,
+                seed=cfg.encoding.seed,
             ),
         ),
     }
@@ -361,6 +366,7 @@ def run_settings(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, Any
         if cfg.slide_feat_dir is None
         else str(cfg.slide_feat_dir),
         "encoder": None if cfg.encoder is None else str(cfg.encoder),
+        "encoding": cfg.encoding.model_dump(mode="json"),
     }
 
 

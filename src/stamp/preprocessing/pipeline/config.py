@@ -99,6 +99,27 @@ class SamplingConfig(BaseModel):
         return "-".join(parts)
 
 
+class EncodingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_size: int | None = Field(default=None, gt=0)
+    """None: encode the patient's whole bag in one go.
+    Otherwise: split a patient with more than chunk_size tiles into random chunks
+    of at most that size, encode each chunk, and average the chunk embeddings.
+    The result has the encoder's fixed size however many tiles the patient has,
+    so every tile can be used (set sampling.enabled: false)."""
+
+    seed: int = 0
+    """Which tiles go into which chunk."""
+
+    @property
+    def tag(self) -> str | None:
+        """Folder name for embeddings made with these settings, None if whole."""
+        if self.chunk_size is None:
+            return None
+        return f"chunk{self.chunk_size}-seed{self.seed}"
+
+
 class ClinicalColumns(BaseModel):
     """Accepted column names for each field of the clinical table, in priority order."""
 
@@ -140,6 +161,8 @@ class PipelineConfig(BaseModel):
     encoder: EncoderName | None = None
     """Optional slide encoder (e.g. titan) run on each patient's bag."""
 
+    encoding: EncodingConfig = EncodingConfig()
+
     encoder_device: str | None = None
     """Device for the encoder. Default: preprocessing.device."""
 
@@ -179,6 +202,8 @@ class PipelineConfig(BaseModel):
             raise ValueError(
                 "slide_feat_dir only applies to order: extract_then_sample"
             )
+        if self.encoding.chunk_size is not None and self.encoder is None:
+            raise ValueError("encoding.chunk_size needs pipeline.encoder")
         if self.steps is not None:
             check_steps(self, self.steps)
         return self
