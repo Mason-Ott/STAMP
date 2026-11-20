@@ -34,7 +34,6 @@ input_dims = {
 # They are not all, just one case that is accepted for each encoder
 used_extractor = {
     EncoderName.CHIEF_CTRANSPATH: ExtractorName.CHIEF_CTRANSPATH,
-    EncoderName.COBRA: ExtractorName.CONCH,
     EncoderName.EAGLE: ExtractorName.CTRANSPATH,
     EncoderName.GIGAPATH: ExtractorName.GIGAPATH,
     EncoderName.MADELEINE: ExtractorName.CONCH,
@@ -82,7 +81,6 @@ def test_if_encoding_crashes(*, tmp_path: Path, encoder: EncoderName):
 
     cuda_required = [
         EncoderName.CHIEF_CTRANSPATH,
-        EncoderName.COBRA,
         EncoderName.GIGAPATH,
         EncoderName.MADELEINE,
         EncoderName.EAGLE,

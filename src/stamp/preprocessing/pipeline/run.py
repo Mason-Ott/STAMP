@@ -11,7 +11,9 @@ from stamp.preprocessing.data.clinical import load_patients
 from stamp.preprocessing.pipeline.config import PipelineConfig, StepName, check_steps
 from stamp.preprocessing.pipeline.plan import (
     ModelLoaders,
+    active_steps,
     build_plan,
+    encoding_possible,
     layout_for,
     record_run_settings,
 )
@@ -31,8 +33,17 @@ def run_pipeline_(
     A failing item doesn't stop the run: it gets a .failed marker, later steps
     report its outputs as missing, and the reports returned here count failures.
     """
-    steps = list(steps) if steps is not None else cfg.default_steps()
+    steps = list(steps) if steps is not None else active_steps(pre, cfg)
     check_steps(cfg, steps)
+    if not encoding_possible(pre, cfg):
+        if StepName.ENCODE in steps:
+            raise ValueError(
+                f"encoder {cfg.encoder} can't use features from {pre.extractor}"
+            )
+        _logger.warning(
+            f"pipeline: skipping encoding: {cfg.encoder} can't use features "
+            f"from {pre.extractor}"
+        )
     record_run_settings(pre, cfg)
 
     patients = load_patients(cfg.clinical_table, cfg.columns, pre.wsi_dir)
@@ -73,5 +84,6 @@ def pipeline_progress(
     plan = build_plan(pre, cfg, patients, ModelLoaders.from_config(pre, cfg))
     stale_after_s = cfg.coordination.lock_stale_after_s
     return {
-        name: step_progress(plan[name], stale_after_s) for name in cfg.default_steps()
+        name: step_progress(plan[name], stale_after_s)
+        for name in active_steps(pre, cfg)
     }

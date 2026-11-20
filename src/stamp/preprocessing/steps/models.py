@@ -22,7 +22,6 @@ T = TypeVar("T")
 
 _ENCODER_CLASSES: dict[EncoderName, tuple[str, str]] = {
     EncoderName.TITAN: ("titan", "Titan"),
-    EncoderName.COBRA: ("cobra", "Cobra"),
     EncoderName.GIGAPATH: ("gigapath", "Gigapath"),
     EncoderName.CHIEF_CTRANSPATH: ("chief", "CHIEF"),
     EncoderName.MADELEINE: ("madeleine", "Madeleine"),
@@ -30,6 +29,21 @@ _ENCODER_CLASSES: dict[EncoderName, tuple[str, str]] = {
 }
 """Encoder -> (module in stamp.encoding.encoder, class). EAGLE is left out: it
 needs a second set of features that the pipeline doesn't produce."""
+
+
+ENCODER_EXTRACTORS: dict[EncoderName, frozenset[ExtractorName]] = {
+    EncoderName.TITAN: frozenset({ExtractorName.CONCH1_5}),
+    EncoderName.GIGAPATH: frozenset({ExtractorName.GIGAPATH}),
+    EncoderName.CHIEF_CTRANSPATH: frozenset({ExtractorName.CHIEF_CTRANSPATH}),
+    EncoderName.MADELEINE: frozenset({ExtractorName.CONCH}),
+    EncoderName.PRISM: frozenset({ExtractorName.VIRCHOW_FULL}),
+}
+"""Features each encoder accepts (its `required_extractors`), known without
+loading the encoder, so incompatible runs can skip encoding up front."""
+
+
+def encoder_accepts(encoder: EncoderName, extractor: ExtractorName) -> bool:
+    return extractor in ENCODER_EXTRACTORS.get(encoder, frozenset({extractor}))
 
 
 class Lazy(Generic[T]):

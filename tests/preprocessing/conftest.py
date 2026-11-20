@@ -66,11 +66,12 @@ def make_configs(dataset: Dataset, tmp_path: Path):
     def make(
         output_name: str = "out", **pipeline: object
     ) -> tuple[PreprocessingConfig, PipelineConfig]:
+        extractor = pipeline.pop("extractor", "ctranspath")
         pre = PreprocessingConfig(
             output_dir=tmp_path / output_name,
             wsi_dir=dataset.wsi_dir,
             cache_dir=dataset.cache_dir,
-            extractor="ctranspath",  # only names folders; the model is a fake
+            extractor=extractor,  # only names folders; the model is a fake
             tile_size_um=TILE_SIZE_UM,
             tile_size_px=TILE_SIZE_PX,
             device="cpu",

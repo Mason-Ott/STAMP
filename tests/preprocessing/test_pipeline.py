@@ -13,7 +13,7 @@ import pytest
 
 from stamp.preprocessing.data.bags import Bag, read_bag
 from stamp.preprocessing.pipeline.config import StepName
-from stamp.preprocessing.pipeline.plan import layout_for
+from stamp.preprocessing.pipeline.plan import active_steps, layout_for
 from stamp.preprocessing.pipeline.run import run_pipeline_
 
 from .conftest import LABELS
@@ -42,6 +42,7 @@ def sample_then_extract(make_configs, fake_models):
         order="sample_then_extract",
         sampling={"n_tiles": N_TILES, "pad_mode": "zero"},
         encoder="titan",
+        extractor="conch1_5",
         keep_intermediates=True,  # the tests compare against the full patient bags
     )
     layout = layout_for(pre, cfg)
@@ -355,25 +356,31 @@ def folder_names(pre, cfg) -> list[str]:
 
 
 def test_stage_folders_are_named_by_the_settings_behind_them(make_configs):
-    pre, cfg = make_configs("ste", encoder="titan", sampling={"n_tiles": 50})
+    pre, cfg = make_configs(
+        "ste", encoder="titan", extractor="conch1_5", sampling={"n_tiles": 50}
+    )
     names = folder_names(pre, cfg)
     assert names[0].startswith("tile_positions/") and names[0].count("um_") == 1
     assert names[1].startswith("patient_positions/") and names[1].endswith("_gap1")
     assert names[2].startswith("sampled_positions/") and names[2].endswith(
         "/first_n-50"
     )
-    assert names[3].startswith("features/ctranspath/") and names[3].endswith(
+    assert names[3].startswith("features/conch1_5/") and names[3].endswith(
         "/first_n-50"
     )
-    assert names[4].startswith("embeddings/titan/ctranspath/")
+    assert names[4].startswith("embeddings/titan/conch1_5/")
 
     pre, cfg = make_configs(
-        "ets", encoder="titan", order="extract_then_sample", sampling={"n_tiles": 50}
+        "ets",
+        encoder="titan",
+        extractor="conch1_5",
+        order="extract_then_sample",
+        sampling={"n_tiles": 50},
     )
     other = folder_names(pre, cfg)
-    assert other[1].startswith("slide_features/ctranspath/")
-    assert other[2].startswith("patient_features/ctranspath/")
-    assert other[3].startswith("features/ctranspath/") and other[3] == names[3]
+    assert other[1].startswith("slide_features/conch1_5/")
+    assert other[2].startswith("patient_features/conch1_5/")
+    assert other[3].startswith("features/conch1_5/") and other[3] == names[3]
     assert other[4] == names[4], "both orders end in the same folders"
 
 
@@ -401,7 +408,12 @@ def test_settings_that_shape_the_results_change_the_folders(make_configs):
 
 def test_only_the_results_remain_without_keep_intermediates(make_configs, fake_models):
     pre, cfg = run(
-        make_configs, fake_models, "tidy", encoder="titan", keep_intermediates=False
+        make_configs,
+        fake_models,
+        "tidy",
+        encoder="titan",
+        extractor="conch1_5",
+        keep_intermediates=False,
     )
     layout = layout_for(pre, cfg)
     assert folder_contents(pre.output_dir) == {
@@ -456,7 +468,9 @@ def test_runs_with_other_settings_share_one_output_dir(make_configs, fake_models
 
 
 def test_settings_are_recorded_next_to_the_results(make_configs, fake_models):
-    pre, cfg = run(make_configs, fake_models, "recorded", encoder="titan")
+    pre, cfg = run(
+        make_configs, fake_models, "recorded", encoder="titan", extractor="conch1_5"
+    )
     layout = layout_for(pre, cfg)
     for folder in (layout.training_bags, layout.embeddings):
         recorded = json.loads((folder / "settings.json").read_text())
@@ -494,3 +508,25 @@ def test_failed_stage_keeps_its_input_for_recovery(
     assert reports[StepName.TILE].done == 0 and reports[StepName.EXTRACT].done == 3
     assert not list(sampled.glob("*.h5"))
     assert len(list(layout.training_bags.glob("*.h5"))) == 3
+
+
+def test_encoding_is_skipped_when_the_encoder_cannot_use_the_extractor(
+    make_configs, fake_models, caplog
+):
+    pre, cfg = make_configs("skip", encoder="titan")  # extractor: ctranspath
+    assert StepName.ENCODE not in active_steps(pre, cfg)
+    assert layout_for(pre, cfg).embeddings is None
+    with caplog.at_level("WARNING", logger="stamp"):
+        reports = run_pipeline_(pre, cfg, models=fake_models)
+    assert StepName.ENCODE not in reports
+    assert all(r.ok for r in reports.values())
+    assert "skipping encoding" in caplog.text
+    assert not list(pre.output_dir.rglob("*.failed"))
+    assert not (pre.output_dir / "embeddings").exists()
+
+    with pytest.raises(ValueError, match="can't use features"):
+        run_pipeline_(pre, cfg, [StepName.ENCODE], models=fake_models)
+
+    # With the extractor TITAN needs, encoding is part of the run.
+    compatible = pre.model_copy(update={"extractor": "conch1_5"})
+    assert StepName.ENCODE in active_steps(compatible, cfg)
