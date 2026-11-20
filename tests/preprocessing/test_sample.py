@@ -110,3 +110,23 @@ def test_sampling_already_sampled_bag_is_stable():
     once = sample(patient_bag([30, 30]), n_tiles=20)
     twice = sample(once, n_tiles=20)
     np.testing.assert_array_equal(once.tile_idx, twice.tile_idx)
+
+
+def test_tissue_fraction_counts_pixels_below_the_cutoff():
+    from PIL import Image
+
+    from stamp.preprocessing.steps.sample import tissue_fraction
+
+    tile = Image.new("RGB", (64, 64), (255, 255, 255))
+    tile.paste((120, 60, 140), (0, 0, 64, 16))  # a quarter of the tile is stained
+    assert tissue_fraction(tile, 220) == pytest.approx(0.25)
+    assert tissue_fraction(tile, 20) == 0.0
+    assert tissue_fraction(Image.new("RGB", (64, 64), (0, 0, 0)), 220) == 1.0
+
+
+def test_tissue_settings_are_part_of_the_folder_tag():
+    assert SamplingConfig(strategy="tissue", n_tiles=50).tag == "tissue-50-seed0"
+    assert (
+        SamplingConfig(strategy="tissue", background_cutoff=200).tag
+        == "tissue-8192-seed0-bg200"
+    )
