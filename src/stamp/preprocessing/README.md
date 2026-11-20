@@ -41,7 +41,7 @@ Folders are named after the settings behind their contents, so **one
 `output_dir` holds any number of runs** (other extractors, sampling settings,
 orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
 `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`,
+extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`,
 `full` without sampling):
 
 | folder | contents |
@@ -92,7 +92,18 @@ files, so `stamp encode_slides` and STAMP training can read them.
 `first_n` sorts each slide's tiles in raster order (top-to-bottom, then
 left-to-right) and takes the first `n_tiles // n_slides` from each slide. With
 `redistribute: true`, quota a small slide can't use goes to the patient's other
-slides. To add a strategy, see `steps/sample.py`.
+slides.
+
+`random` takes a seeded uniform sample from each slide.
+
+`tissue` keeps the tiles with the least background: each tile is scored by the
+share of its pixels that are not background (grey value below
+`background_cutoff`, default 220), and each slide's best `n_tiles // n_slides`
+tiles are kept, ties broken at random (`seed`). It reads the tile images from
+the tile cache, which costs about one pass over the cached tiles of every slide
+that has more tiles than its quota. Slides that fit entirely aren't scored.
+
+To add a strategy, see `steps/sample.py`.
 
 ## Running on several machines
 
