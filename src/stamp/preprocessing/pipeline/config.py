@@ -1,0 +1,209 @@
+"""Configuration for the patient-level preprocessing pipeline (`pipeline:` section).
+
+Tiling and extractor settings stay in STAMP's own PreprocessingConfig
+(`preprocessing:` section); this adds what the patient-level stages need.
+"""
+
+from collections.abc import Sequence
+from enum import StrEnum
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from stamp.distributed.config import CoordinationConfig, WorkersConfig
+from stamp.encoding.config import EncoderName
+
+
+class Order(StrEnum):
+    SAMPLE_THEN_EXTRACT = "sample_then_extract"
+    """tile -> combine -> sample -> extract. Only sampled tiles go through the model."""
+
+    EXTRACT_THEN_SAMPLE = "extract_then_sample"
+    """tile -> extract_slides -> combine -> sample. Every tile goes through the
+    model."""
+
+
+class StepName(StrEnum):
+    TILE = "tile"
+    """WSI -> per-slide tile positions (+ STAMP tile cache)"""
+
+    IMPORT_SLIDES = "import_slides"
+    """per-slide features from plain `stamp preprocess` -> per-slide bags"""
+
+    EXTRACT_SLIDES = "extract_slides"
+    """per-slide tile positions -> per-slide features"""
+
+    COMBINE = "combine"
+    """per-slide bags -> one bag per patient"""
+
+    SAMPLE = "sample"
+    """patient bag -> patient bag with at most n_tiles tiles"""
+
+    EXTRACT = "extract"
+    """patient tile positions -> patient features"""
+
+    ENCODE = "encode"
+    """patient features -> one embedding per patient (e.g. TITAN)"""
+
+
+SamplingStrategy = Literal["first_n", "random"]
+PadMode = Literal["none", "zero", "repeat"]
+
+
+class SamplingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+
+    strategy: SamplingStrategy = "first_n"
+    """first_n: first tiles of each slide in raster order (top-to-bottom, then
+    left-to-right).
+    random: uniformly random tiles within each slide (uses `seed`)."""
+
+    n_tiles: int = Field(default=8192, gt=0)
+    """Bag size per patient. Each slide gets n_tiles // n_slides tiles."""
+
+    redistribute: bool = True
+    """If a slide has fewer tiles than its quota, give the unused quota to the
+    patient's other slides. If False, such patients just get a smaller bag."""
+
+    pad_mode: PadMode = "none"
+    """What to do when a patient has fewer than n_tiles tiles in total.
+    none: keep the smaller bag. zero: append all-zero tiles (mask=False).
+    repeat: cycle through the patient's tiles again (mask=True)."""
+
+    seed: int = 0
+
+    @property
+    def tag(self) -> str:
+        """Folder name for bags produced with these settings, e.g. first_n-8192."""
+        if not self.enabled:
+            return "full"
+        parts = [self.strategy, str(self.n_tiles)]
+        if self.strategy == "random":
+            parts.append(f"seed{self.seed}")
+        if not self.redistribute:
+            parts.append("noredist")
+        if self.pad_mode != "none":
+            parts.append(f"pad_{self.pad_mode}")
+        return "-".join(parts)
+
+
+class ClinicalColumns(BaseModel):
+    """Accepted column names for each field of the clinical table, in priority order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    patient_id: list[str] = ["patient_id", "Patient"]
+    slide_id: list[str] = ["slide_id", "StudyID/SlideID"]
+    label: list[str] = ["label", "isLNM"]
+    hospital: list[str] = ["hospital"]
+
+
+class PipelineConfig(BaseModel):
+    """Settings for `stamp preprocess` when run as the patient-level pipeline.
+
+    Tiling and extractor settings (wsi_dir, output_dir, tile sizes, extractor,
+    device, cache_dir, cutoffs, ...) come from the `preprocessing` section.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    clinical_table: Path
+    """CSV with patient_id, slide_id, label, hospital (or the aliases in `columns`)."""
+
+    columns: ClinicalColumns = ClinicalColumns()
+
+    order: Order = Order.SAMPLE_THEN_EXTRACT
+
+    steps: list[StepName] | None = None
+    """Steps to run. Default: every step for `order` (see `default_steps`).
+    Overridden on the command line by `--steps`."""
+
+    sampling: SamplingConfig = SamplingConfig()
+
+    slide_feat_dir: Path | None = None
+    """extract_then_sample only: per-slide features from plain `stamp preprocess`
+    (e.g. .../conch1_5-c1ab6684). Replaces the tile and extract_slides steps with
+    import_slides."""
+
+    encoder: EncoderName | None = None
+    """Optional slide encoder (e.g. titan) run on each patient's bag."""
+
+    encoder_device: str | None = None
+    """Device for the encoder. Default: preprocessing.device."""
+
+    batch_size: int = Field(default=64, gt=0)
+
+    num_workers: int = Field(default=4, ge=0)
+    """DataLoader workers decoding cached JPEG tiles during extraction."""
+
+    allow_missing_slides: bool = False
+    """If False, a patient with a missing or failed slide is an error.
+    If True, the patient is combined from the slides that are available."""
+
+    keep_intermediates: bool = True
+    """Keep every stage's files. This is what lets other runs in the same
+    output_dir reuse them (other sampling settings, encoders or extractors, or
+    the other order). If False, a stage's files are deleted once the next stage
+    has written its own, so only the latest finished stage remains (plus the
+    training features and embeddings): saves disk, but a run with different
+    settings starts again from the slides. Slide features of
+    extract_then_sample are the biggest files."""
+
+    drop_edge_tiles: bool = True
+    """Drop tiles that extend past the bottom/right edge of the scan. STAMP's tiler
+    can keep these (they are partly black padding)."""
+
+    virtual_gap_tiles: int = Field(default=1, ge=0)
+    """Empty tiles between slides when laying a patient's slides side by side."""
+
+    coordination: CoordinationConfig = CoordinationConfig()
+
+    workers: WorkersConfig | None = None
+    """Hosts to run on with `stamp workers start`. Not needed to run locally."""
+
+    @model_validator(mode="after")
+    def _check(self) -> "PipelineConfig":
+        if self.slide_feat_dir is not None and self.order != Order.EXTRACT_THEN_SAMPLE:
+            raise ValueError(
+                "slide_feat_dir only applies to order: extract_then_sample"
+            )
+        if self.steps is not None:
+            check_steps(self, self.steps)
+        return self
+
+    def default_steps(self) -> list[StepName]:
+        """All steps that make sense for this configuration, in run order."""
+        if self.order == Order.SAMPLE_THEN_EXTRACT:
+            steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE, StepName.EXTRACT]
+        elif self.slide_feat_dir is not None:
+            steps = [StepName.IMPORT_SLIDES, StepName.COMBINE, StepName.SAMPLE]
+        else:
+            steps = [
+                StepName.TILE,
+                StepName.EXTRACT_SLIDES,
+                StepName.COMBINE,
+                StepName.SAMPLE,
+            ]
+        if not self.sampling.enabled:
+            steps.remove(StepName.SAMPLE)
+        if self.encoder is not None:
+            steps.append(StepName.ENCODE)
+        return steps
+
+
+def check_steps(cfg: PipelineConfig, steps: Sequence[StepName]) -> None:
+    """Reject steps that don't belong to the configured order, before anything runs."""
+    allowed = set(cfg.default_steps())
+    if cfg.encoder is None and StepName.ENCODE in steps:
+        raise ValueError("step 'encode' needs pipeline.encoder (e.g. titan)")
+    if StepName.SAMPLE in steps and not cfg.sampling.enabled:
+        raise ValueError("step 'sample' needs pipeline.sampling.enabled: true")
+    if bad := [str(s) for s in steps if s not in allowed]:
+        raise ValueError(
+            f"steps {bad} don't apply to order {cfg.order}"
+            f"{' with slide_feat_dir' if cfg.slide_feat_dir else ''}; "
+            f"valid steps: {[str(s) for s in cfg.default_steps()]}"
+        )

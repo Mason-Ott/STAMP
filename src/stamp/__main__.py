@@ -84,6 +84,24 @@ def _run_cli(args: argparse.Namespace) -> None:
                 "using the following configuration:\n"
                 f"{yaml.dump(config.preprocessing.model_dump(mode='json', exclude_none=True))}"
             )
+            if args.save_visualisations is not None:
+                config.preprocessing.save_visualisations = args.save_visualisations
+
+            if config.pipeline is not None:
+                from stamp.preprocessing.pipeline.config import StepName
+                from stamp.preprocessing.pipeline.run import run_pipeline_
+
+                _logger.info(
+                    "pipeline configuration:\n"
+                    f"{yaml.dump(config.pipeline.model_dump(mode='json', exclude_none=True))}"
+                )
+                steps = None if args.steps is None else [StepName(s) for s in args.steps]
+                reports = run_pipeline_(config.preprocessing, config.pipeline, steps)
+                if not all(report.ok for report in reports.values()):
+                    _logger.error("pipeline finished with failed or skipped items")
+                    sys.exit(1)
+                return
+
             extract_(
                 output_dir=config.preprocessing.output_dir,
                 wsi_dir=config.preprocessing.wsi_dir,
@@ -107,6 +125,31 @@ def _run_cli(args: argparse.Namespace) -> None:
                 visualisation_max_dimension=(
                     config.preprocessing.visualisation_max_dimension
                 ),
+            )
+
+        case "worker":
+            from stamp.preprocessing.pipeline.config import StepName
+            from stamp.preprocessing.pipeline.run import run_pipeline_worker
+
+            if config.preprocessing is None or config.pipeline is None:
+                raise ValueError("`stamp worker` needs preprocessing and pipeline sections")
+            steps = None if args.steps is None else [StepName(s) for s in args.steps]
+            sys.exit(run_pipeline_worker(config.preprocessing, config.pipeline, steps))
+
+        case "workers":
+            from stamp.preprocessing.pipeline.cli import workers_command
+            from stamp.preprocessing.pipeline.config import StepName
+
+            if config.preprocessing is None or config.pipeline is None:
+                raise ValueError("`stamp workers` needs preprocessing and pipeline sections")
+            workers_command(
+                config.preprocessing,
+                config.pipeline,
+                config_file=Path(args.config_file_path),
+                action=args.action,
+                hosts=args.hosts,
+                steps=None if args.steps is None else [StepName(s) for s in args.steps],
+                force=args.force,
             )
 
         case "encode_slides":
@@ -240,6 +283,17 @@ def _add_file_handle_(logger: logging.Logger, *, output_dir: Path) -> None:
     logger.addHandler(file_handler)
 
 
+def _parse_steps(value: str) -> list[str]:
+    """argparse type for --steps: a comma-separated list of pipeline step names."""
+    from stamp.preprocessing.pipeline.config import StepName
+
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    valid = [str(step) for step in StepName]
+    if unknown := [name for name in names if name not in valid]:
+        raise argparse.ArgumentTypeError(f"unknown steps {unknown}; choose from {valid}")
+    return names
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="stamp", description="STAMP: Solid Tumor Associative Modeling in Pathology"
@@ -280,6 +334,49 @@ def main() -> None:
     )
 
     preprocess_parser.set_defaults(save_visualisations=None)
+    preprocess_parser.add_argument(
+        "--steps",
+        type=_parse_steps,
+        default=None,
+        help=(
+            "Pipeline only: comma-separated steps to run, e.g. 'tile' or "
+            "'combine,sample'. Choices: tile, import_slides, extract_slides, "
+            "combine, sample, extract, encode. Default: every step for "
+            "pipeline.order."
+        ),
+    )
+    workers_parser = commands.add_parser(
+        "workers",
+        help="Start, check or stop pipeline workers on other machines (over SSH)",
+    )
+    workers_parser.add_argument("action", choices=["start", "status", "stop"])
+    workers_parser.add_argument(
+        "--hosts",
+        type=lambda value: [h.strip() for h in value.split(",") if h.strip()],
+        default=None,
+        help="Comma-separated subset of pipeline.workers.hosts (default: all)",
+    )
+    workers_parser.add_argument(
+        "--steps", type=_parse_steps, default=None, help="Steps for the workers to run"
+    )
+    workers_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="stop: kill the workers immediately instead of letting them clean up",
+    )
+    worker_parser = commands.add_parser(
+        "worker",
+        help="Run the pipeline on this machine as one of several workers "
+        "(started by `stamp workers start`)",
+    )
+    worker_parser.add_argument(
+        "--steps", type=_parse_steps, default=None, help="Steps to run"
+    )
+    worker_parser.add_argument(
+        "--session",
+        default=None,
+        help="Name that lets `stamp workers stop` find this process",
+    )
     commands.add_parser(
         "encode_slides",
         help="Encode patch-level features into slide-level embeddings",

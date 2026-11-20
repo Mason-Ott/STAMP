@@ -65,6 +65,69 @@ class _Tile(NamedTuple, Generic[_Unit]):
     """Length of the tile's sides"""
 
 
+class _TilerParams(TypedDict):
+    """The parameters used during tiling / background rejection"""
+
+    slide_path: str
+    """The path of the WSI the features were extracted from"""
+    tile_size_um: Microns
+    """Length of each tile in microns"""
+    tile_size_px: TilePixels
+    """Length of each tile in pixels"""
+    max_supertile_size_slide_px: SlidePixels
+
+    brightness_cutoff: int | None
+    """Tiles with an average brightness larger than this get rejected"""
+
+    canny_cutoff: float | None
+    """Tiles with a lower ratio of edge pixels than this get rejected"""
+
+    code_sha256: str
+    """The hash of this file at the time of extraction"""
+    # Including this ensures that,
+    # if we change the tile rejection strategy,
+    # the cache also gets invalidated
+
+    tile_ext: ImageExtension
+    """The extension of the cached tiles"""
+
+
+def make_tiler_params(
+    slide_path: Path,
+    *,
+    cache_tiles_ext: ImageExtension,
+    tile_size_um: Microns,
+    tile_size_px: TilePixels,
+    max_supertile_size_slide_px: SlidePixels,
+    brightness_cutoff: int | None,
+    canny_cutoff: float | None,
+) -> _TilerParams:
+    """Every setting that changes which tiles end up in the cache.
+
+    All of these go into the cache key, so changing any of them makes a new cache.
+    """
+    return {
+        "slide_path": str(slide_path),
+        "tile_size_um": tile_size_um,
+        "tile_size_px": tile_size_px,
+        "max_supertile_size_slide_px": max_supertile_size_slide_px,
+        "brightness_cutoff": brightness_cutoff,
+        "canny_cutoff": canny_cutoff,
+        "code_sha256": _CODE_HASH,
+        "tile_ext": cache_tiles_ext,
+    }
+
+
+def cache_file_for(
+    cache_dir: Path, slide_path: Path, tiler_params: _TilerParams
+) -> Path:
+    """Path of the tile cache zip for a slide tiled with `tiler_params`."""
+    tiler_params_hash = hashlib.sha256(
+        json.dumps(tiler_params, sort_keys=True).encode()
+    ).hexdigest()
+    return cache_dir / slide_path.with_suffix(f".{tiler_params_hash}.zip").name
+
+
 def tiles_with_cache(
     slide_path: Path,
     *,
@@ -94,21 +157,16 @@ def tiles_with_cache(
         )
         return
 
-    tiler_params: _TilerParams = {
-        "slide_path": str(slide_path),
-        "tile_size_um": tile_size_um,
-        "tile_size_px": tile_size_px,
-        "max_supertile_size_slide_px": max_supertile_size_slide_px,
-        "brightness_cutoff": brightness_cutoff,
-        "code_sha256": _CODE_HASH,
-        "tile_ext": cache_tiles_ext,
-    }
-    tiler_params_hash = hashlib.sha256(
-        json.dumps(tiler_params, sort_keys=True).encode()
-    ).hexdigest()
-    cache_file_path = (
-        cache_dir / slide_path.with_suffix(f".{tiler_params_hash}.zip").name
+    tiler_params = make_tiler_params(
+        slide_path,
+        cache_tiles_ext=cache_tiles_ext,
+        tile_size_um=tile_size_um,
+        tile_size_px=tile_size_px,
+        max_supertile_size_slide_px=max_supertile_size_slide_px,
+        brightness_cutoff=brightness_cutoff,
+        canny_cutoff=canny_cutoff,
     )
+    cache_file_path = cache_file_for(cache_dir, slide_path, tiler_params)
     if cache_file_path.exists():
         # If we have a cached version of the tiles
         # which were extracted with the same params / code,
@@ -351,30 +409,6 @@ class MPPExtractionError(Exception):
     """Raised when the Microns Per Pixel (MPP) extraction from the slide's metadata fails"""
 
     pass
-
-
-class _TilerParams(TypedDict):
-    """The parameters used during tiling / background rejection"""
-
-    slide_path: str
-    """The path of the WSI the features were extracted from"""
-    tile_size_um: Microns
-    """Length of each tile in microns"""
-    tile_size_px: TilePixels
-    """Length of each tile in pixels"""
-    max_supertile_size_slide_px: SlidePixels
-
-    brightness_cutoff: int | None
-    """Tiles with an average brightness larger than this get rejected"""
-
-    code_sha256: str
-    """The hash of this file at the time of extraction"""
-    # Including this ensures that,
-    # if we change the tile rejection strategy,
-    # the cache also gets invalidated
-
-    tile_ext: ImageExtension
-    """The extension of the cached tiles"""
 
 
 def _tiles_from_cache_file(cache_file_path: Path) -> Iterator[_Tile]:

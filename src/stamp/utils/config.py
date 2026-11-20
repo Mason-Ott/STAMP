@@ -7,6 +7,7 @@ from stamp.modeling.config import (
     DeploymentConfig,
     TrainConfig,
 )
+from stamp.preprocessing.pipeline.config import PipelineConfig
 from stamp.preprocessing.config import PreprocessingConfig
 
 
@@ -14,6 +15,10 @@ class StampConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     preprocessing: PreprocessingConfig | None = None
+
+    pipeline: PipelineConfig | None = None
+    """If set, `stamp preprocess` runs the patient-level pipeline
+    (stamp.preprocessing.pipeline)."""
 
     slide_encoding: SlideEncodingConfig | None = None
 
