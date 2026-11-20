@@ -530,3 +530,71 @@ def test_encoding_is_skipped_when_the_encoder_cannot_use_the_extractor(
     # With the extractor TITAN needs, encoding is part of the run.
     compatible = pre.model_copy(update={"extractor": "conch1_5"})
     assert StepName.ENCODE in active_steps(compatible, cfg)
+
+
+def test_chunked_encoding_averages_chunk_embeddings_of_all_tiles(
+    make_configs, fake_models
+):
+    pre, cfg = make_configs(
+        "chunked",
+        encoder="titan",
+        extractor="conch1_5",
+        sampling={"enabled": False},
+        encoding={"chunk_size": 20, "seed": 3},
+    )
+    reports = run_pipeline_(pre, cfg, models=fake_models)
+    assert all(r.ok for r in reports.values()), reports
+
+    layout = layout_for(pre, cfg)
+    assert layout.embeddings.name == "chunk20-seed3"
+    bags = read_folder(layout.training_bags)
+    calls = fake_models.encoder.get().calls
+    assert all(len(feats) <= 20 for feats, _ in calls)
+
+    # Every tile of every patient goes through the encoder exactly once.
+    assert sum(len(feats) for feats, _ in calls) == sum(
+        len(bag.distinct_tiles()[0]) for bag in bags.values()
+    )
+    big = max(bags.values(), key=len)
+    assert len(big.distinct_tiles()[0]) > 20, "the test needs a patient with chunks"
+
+    for key, bag in bags.items():
+        with h5py.File(layout.embeddings / f"{key}.h5") as f:
+            embedding, n_chunks = f["feats"][:], f.attrs["n_chunks"]
+        rows, _ = bag.distinct_tiles()
+        assert n_chunks == -(-len(rows) // 20)
+        # fake embedding = mean tile feature; mean of equal-size chunk means
+        # is the mean over all tiles when chunks have equal size, else close to it
+        np.testing.assert_allclose(
+            embedding, bag.feats[rows].mean(0), rtol=0.05, atol=0.05
+        )
+
+
+def test_chunks_are_random_but_reproducible_and_cover_the_bag(sample_then_extract):
+    from stamp.preprocessing.steps.encode import EncodingSettings, chunks_of
+
+    bag = next(b for b in sample_then_extract["bags"].values() if len(b) > 40)
+    rows = bag.distinct_tiles()[0]
+    settings = EncodingSettings(device="cpu", chunk_size=25, seed=1)
+    chunks = chunks_of(bag, settings)
+    again = chunks_of(bag, settings)
+    other = chunks_of(bag, EncodingSettings(device="cpu", chunk_size=25, seed=2))
+    assert all(len(c) <= 25 for c in chunks)
+    assert sorted(np.concatenate(chunks)) == sorted(rows)
+    assert all(np.array_equal(a, b) for a, b in zip(chunks, again, strict=True))
+    assert not all(np.array_equal(a, b) for a, b in zip(chunks, other, strict=True))
+    whole = chunks_of(bag, EncodingSettings(device="cpu", chunk_size=10**6))
+    assert len(whole) == 1 and np.array_equal(whole[0], rows)
+
+
+def test_chunking_settings_name_the_embedding_folder(make_configs):
+    base_pre, base_cfg = make_configs("x", encoder="titan", extractor="conch1_5")
+    pre, cfg = make_configs(
+        "x", encoder="titan", extractor="conch1_5", encoding={"chunk_size": 100}
+    )
+    base, chunked = folder_names(base_pre, base_cfg), folder_names(pre, cfg)
+    assert chunked[:-1] == base[:-1], "only the embeddings differ"
+    assert chunked[-1] == f"{base[-1]}/chunk100-seed0"
+
+    with pytest.raises(ValueError, match="chunk_size needs pipeline.encoder"):
+        make_configs("x", encoding={"chunk_size": 100})

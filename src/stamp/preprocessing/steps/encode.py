@@ -5,7 +5,9 @@ virtual slide), except that padding rows and repeated tiles are left out, and
 the patient's label and IDs are stored with the embedding.
 
 Encoder memory grows quickly with the number of tiles, so unsampled bags of
-large patients may not fit on the GPU; sampled bags are bounded by n_tiles.
+large patients may not fit on the GPU. Either sample (bags are bounded by
+n_tiles) or set a chunk size: the tiles are then encoded in random chunks and
+the chunk embeddings averaged, which gives the same fixed-size embedding.
 """
 
 import dataclasses
@@ -22,12 +24,17 @@ from stamp.modeling.data import CoordsInfo
 from stamp.preprocessing.data.bags import Bag, patient_attrs, read_bag
 from stamp.preprocessing.data.files import atomic_h5_file
 from stamp.preprocessing.steps.models import Lazy
+from stamp.preprocessing.steps.sample import patient_rng
 from stamp.types import Microns, TilePixels
 
 
 @dataclass(frozen=True)
 class EncodingSettings:
     device: str
+    chunk_size: int | None = None
+    """See `EncodingConfig.chunk_size`."""
+
+    seed: int = 0
 
 
 def run(
@@ -43,7 +50,7 @@ def run(
     bag = read_bag(bag_file)
     model = encoder.get()
     embedding = encode_bag(bag, model, settings)
-    _write_embedding(output, embedding, bag, model)
+    _write_embedding(output, embedding, bag, model, settings)
 
 
 def encode_bag(
@@ -58,17 +65,49 @@ def encode_bag(
             f"not {bag.extractor}"
         )
 
+    embeddings = [
+        _encode_rows(bag, rows, encoder, settings.device)
+        for rows in chunks_of(bag, settings)
+    ]
+    if len(embeddings) == 1:
+        return embeddings[0]
+    mean = np.mean(np.stack(embeddings).astype(np.float64), axis=0)
+    return mean.astype(embeddings[0].dtype)
+
+
+def chunks_of(bag: Bag, settings: EncodingSettings) -> list[npt.NDArray[np.int64]]:
+    """Rows of the bag's distinct tiles for each encoder call, in bag order.
+
+    One chunk with every tile, unless `chunk_size` is set and the bag is larger:
+    then random chunks of (nearly) equal size, none above `chunk_size`.
+    """
     rows, _ = bag.distinct_tiles()
+    if settings.chunk_size is None or len(rows) <= settings.chunk_size:
+        return [rows]
+    group_key = bag.patient.group_key if bag.patient is not None else ""
+    shuffled = patient_rng(settings.seed, group_key).permutation(rows)
+    n_chunks = -(-len(rows) // settings.chunk_size)
+    return [np.sort(chunk) for chunk in np.array_split(shuffled, n_chunks)]
+
+
+def _encode_rows(
+    bag: Bag, rows: npt.NDArray[np.int64], encoder: Encoder, device: str
+) -> npt.NDArray[np.floating]:
+    assert bag.feats is not None
     feats = torch.from_numpy(bag.feats[rows]).to(dtype=encoder.precision)
     coords = CoordsInfo(
         bag.coords[rows], Microns(bag.tile_size_um), TilePixels(bag.tile_size_px)
     )
     # Same call `stamp encode_slides` makes for each slide.
-    return encoder._generate_slide_embedding(feats, settings.device, coords=coords)
+    return encoder._generate_slide_embedding(feats, device, coords=coords)
 
 
 def _write_embedding(
-    output: Path, embedding: npt.NDArray[np.floating], bag: Bag, encoder: Encoder
+    output: Path,
+    embedding: npt.NDArray[np.floating],
+    bag: Bag,
+    encoder: Encoder,
+    settings: EncodingSettings,
 ) -> None:
     import stamp
 
@@ -81,6 +120,7 @@ def _write_embedding(
                 "extractor": str(bag.extractor),
                 "precision": str(encoder.precision),
                 "n_tiles": len(bag.distinct_tiles()[0]),
+                "n_chunks": len(chunks_of(bag, settings)),
                 "stamp_version": stamp.__version__,
             }
         )
