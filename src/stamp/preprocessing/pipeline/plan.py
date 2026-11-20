@@ -50,7 +50,12 @@ from stamp.preprocessing.steps import (
     sample,
     tile,
 )
-from stamp.preprocessing.steps.models import Lazy, load_encoder, load_extractor
+from stamp.preprocessing.steps.models import (
+    Lazy,
+    encoder_accepts,
+    load_encoder,
+    load_extractor,
+)
 
 SLIDE_STEPS = frozenset(
     {StepName.TILE, StepName.IMPORT_SLIDES, StepName.EXTRACT_SLIDES}
@@ -94,8 +99,22 @@ class Layout:
         return encoding[0].folder if encoding else None
 
 
-def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
+def encoding_possible(pre: PreprocessingConfig, cfg: PipelineConfig) -> bool:
+    """Whether the encoder accepts the features the extractor makes."""
+    return cfg.encoder is None or encoder_accepts(cfg.encoder, pre.extractor)
+
+
+def active_steps(pre: PreprocessingConfig, cfg: PipelineConfig) -> list[StepName]:
+    """`cfg.default_steps()`, without encoding if the encoder can't use the
+    extractor's features (e.g. TITAN needs conch1_5)."""
     steps = cfg.default_steps()
+    if encoding_possible(pre, cfg):
+        return steps
+    return [s for s in steps if s != StepName.ENCODE]
+
+
+def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
+    steps = active_steps(pre, cfg)
     last_data_step = [s for s in steps if s != StepName.ENCODE][-1]
     extractor = str(pre.extractor)
     base = _base_tag(pre, cfg)

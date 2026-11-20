@@ -39,11 +39,6 @@ def init_slide_encoder_(
             from stamp.encoding.encoder.titan import Titan
 
             selected_encoder: Encoder = Titan()
-        case EncoderName.COBRA:
-            from stamp.encoding.encoder.cobra import Cobra
-
-            selected_encoder: Encoder = Cobra()
-
         case EncoderName.EAGLE:
             from stamp.encoding.encoder.eagle import Eagle
 
@@ -120,11 +115,6 @@ def init_patient_encoder_(
     """
 
     match encoder:
-        case EncoderName.COBRA:
-            from stamp.encoding.encoder.cobra import Cobra
-
-            selected_encoder: Encoder = Cobra()
-
         case EncoderName.EAGLE:
             from stamp.encoding.encoder.eagle import Eagle
 

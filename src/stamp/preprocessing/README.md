@@ -66,6 +66,11 @@ the STAMP tile cache are shared); adding an `encoder` redoes only encoding;
 changing tile size or cutoffs starts from the slides (the tile cache is keyed
 the same way).
 
+**Encoding needs a compatible extractor.** An `encoder` only accepts features
+from certain extractors (TITAN: `conch1_5`). With any other extractor the run
+logs a warning and skips the `encode` step; asking for `--steps encode`
+explicitly is an error.
+
 **Intermediate files are kept** (`keep_intermediates: true`, the default), which
 is what makes that reuse possible. Set it to `false` to save disk: a stage's
 file is then deleted once the next stage has written its own, so only the latest
