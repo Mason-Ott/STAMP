@@ -86,6 +86,33 @@ their own folder (`.../chunk8192-seed0/`) and record `n_chunks`. The tiles of a
 chunk are a random subset spread over the whole patient, so TITAN sees them at
 their usual positions with gaps between them.
 
+**One embedding per slide, then combine them.** To encode each slide on its
+own (e.g. four TITAN embeddings for a patient with four WSIs) and combine them:
+
+```yaml
+pipeline:
+  encoder: titan
+  encoding:
+    slide_aggregation: mean      # mean | max | concat
+    # max_slides: 6              # concat only: slots per patient, zero-padded
+```
+
+- `mean`: the average of the slide embeddings, `max`: the element-wise maximum
+  (both 768 numbers for TITAN), `concat`: the slide embeddings one after the
+  other in slide-id order, zero-padded to `max_slides` slides (`6 * 768`
+  numbers). `max_slides` must be at least the largest number of slides of any
+  patient; the run logs that number and refuses to start if it is too small.
+  Which slot a slide gets carries no meaning across patients, so concatenation
+  suits small, fixed slide counts best.
+- The per-slide embeddings are written once to `slide_embeddings/...`
+  (`slide_feats`: one row per slide, plus `slide_ids`); the `aggregate` step then
+  writes the patient embeddings to `embeddings/.../slides_<method>/`. Trying
+  another method reruns only `aggregate`: change `slide_aggregation` and run
+  again, nothing is re-encoded.
+- A slide's tiles use the slide's own coordinates. With `chunk_size`, chunking
+  happens within each slide (chunk embeddings averaged), so sampling off plus
+  chunks gives every tile of every slide.
+
 **Encoding needs a compatible extractor.** An `encoder` only accepts features
 from certain extractors (TITAN: `conch1_5`). With any other extractor the run
 logs a warning and skips the `encode` step; asking for `--steps encode`
