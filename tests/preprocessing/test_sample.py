@@ -125,8 +125,8 @@ def test_tissue_fraction_counts_pixels_below_the_cutoff():
 
 
 def test_tissue_settings_are_part_of_the_folder_tag():
-    assert SamplingConfig(strategy="tissue", n_tiles=50).tag == "tissue-50-seed0"
+    assert SamplingConfig(strategy="tissue", n_tiles=50).tag == "tissue-50"
     assert (
         SamplingConfig(strategy="tissue", background_cutoff=200).tag
-        == "tissue-8192-seed0-bg200"
+        == "tissue-8192-bg200"
     )
