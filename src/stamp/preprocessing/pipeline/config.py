@@ -57,7 +57,7 @@ ENCODING_STEPS = (StepName.ENCODE, StepName.AGGREGATE)
 SlideAggregation = Literal["mean", "max", "concat"]
 
 
-SamplingStrategy = Literal["first_n", "random"]
+SamplingStrategy = Literal["first_n", "random", "tissue"]
 PadMode = Literal["none", "zero", "repeat"]
 
 
@@ -69,7 +69,10 @@ class SamplingConfig(BaseModel):
     strategy: SamplingStrategy = "first_n"
     """first_n: first tiles of each slide in raster order (top-to-bottom, then
     left-to-right).
-    random: uniformly random tiles within each slide (uses `seed`)."""
+    random: uniformly random tiles within each slide (uses `seed`).
+    tissue: the tiles with the least background within each slide (see
+    `background_cutoff`); ties are broken randomly (uses `seed`). Reads the
+    tile images from the tile cache, so it needs the tile step."""
 
     n_tiles: int = Field(default=8192, gt=0)
     """Bag size per patient. Each slide gets n_tiles // n_slides tiles."""
@@ -85,14 +88,20 @@ class SamplingConfig(BaseModel):
 
     seed: int = 0
 
+    background_cutoff: int = Field(default=220, gt=0, lt=256)
+    """tissue only: a pixel counts as background if its grey value (0-255) is at
+    least this. A tile's score is its fraction of non-background pixels."""
+
     @property
     def tag(self) -> str:
         """Folder name for bags produced with these settings, e.g. first_n-8192."""
         if not self.enabled:
             return "full"
         parts = [self.strategy, str(self.n_tiles)]
-        if self.strategy == "random":
+        if self.strategy in ("random", "tissue"):
             parts.append(f"seed{self.seed}")
+        if self.strategy == "tissue" and self.background_cutoff != 220:
+            parts.append(f"bg{self.background_cutoff}")
         if not self.redistribute:
             parts.append("noredist")
         if self.pad_mode != "none":

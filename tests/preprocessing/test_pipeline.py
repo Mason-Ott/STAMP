@@ -532,6 +532,44 @@ def test_encoding_is_skipped_when_the_encoder_cannot_use_the_extractor(
     assert StepName.ENCODE in active_steps(compatible, cfg)
 
 
+def test_tissue_sampling_keeps_the_tiles_with_the_least_background(
+    make_configs, fake_models
+):
+    from stamp.preprocessing.slides.tile_cache import TileReader
+    from stamp.preprocessing.steps.sample import tissue_fraction
+
+    n_tiles = 20
+    pre, cfg = make_configs(
+        "tissue", sampling={"strategy": "tissue", "n_tiles": n_tiles}
+    )
+    steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE]
+    reports = run_pipeline_(pre, cfg, steps, models=fake_models)
+    assert all(r.ok for r in reports.values()), reports
+
+    layout = layout_for(pre, cfg)
+    full = read_folder(layout.stage(StepName.COMBINE).folder)
+    sampled = read_folder(layout.stage(StepName.SAMPLE).folder)
+    reader = TileReader()
+    checked = 0
+    for key, bag in sampled.items():
+        assert len(bag) <= n_tiles
+        for k, slide in enumerate(bag.slides):
+            kept = {
+                tuple(c)
+                for c in bag.coords_slide[bag.mask & (bag.slide_idx == k)].tolist()
+            }
+            all_tiles = full[key].coords_slide[full[key].slide_idx == k].tolist()
+            score = {
+                tuple(c): tissue_fraction(reader.read(slide.cache_file, tuple(c)), 220)
+                for c in all_tiles
+            }
+            dropped = [s for c, s in score.items() if c not in kept]
+            if not dropped:
+                continue
+            checked += 1
+            assert min(score[c] for c in kept) >= max(dropped), (key, slide.slide_id)
+    assert checked, "the test needs a slide with more tiles than its quota"
+    reader.close()
 def test_chunked_encoding_averages_chunk_embeddings_of_all_tiles(
     make_configs, fake_models
 ):

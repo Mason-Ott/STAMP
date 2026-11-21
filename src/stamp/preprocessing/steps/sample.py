@@ -5,7 +5,8 @@ budget is split evenly across the patient's slides (see `allocate`); a sampling
 strategy then picks that many tiles from each slide.
 
 To add a strategy: write a function with the `Sampler` signature, add it to
-SAMPLERS, and add its name to `SamplingStrategy` in pipeline/config.py.
+SAMPLERS, and add its name to `SamplingStrategy` in pipeline/config.py. Samplers
+only see their own slide's rows, in raster order, and return rows in that order.
 """
 
 import dataclasses
@@ -16,31 +17,78 @@ from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+from PIL import Image
 
 from stamp.preprocessing.data.bags import Bag, SamplingSummary, read_bag, write_bag
 from stamp.preprocessing.data.clinical import Patient
 from stamp.preprocessing.pipeline.config import SamplingConfig, SamplingStrategy
 from stamp.preprocessing.slides.overview import save_patient_overview
+from stamp.preprocessing.slides.tile_cache import TileReader
 
 _logger = logging.getLogger("stamp")
 
 Rows = npt.NDArray[np.int64]
 
-Sampler = Callable[[Rows, int, np.random.Generator], Rows]
-"""(one slide's rows in raster order, how many to take, rng) -> the rows to keep"""
+Sampler = Callable[[Bag, Rows, int, SamplingConfig, np.random.Generator], Rows]
+"""(patient bag, one slide's rows in raster order, how many to take, settings, rng)
+-> the rows to keep, in raster order"""
 
 
-def first_n(rows: Rows, n: int, rng: np.random.Generator) -> Rows:
+def first_n(
+    bag: Bag, rows: Rows, n: int, settings: SamplingConfig, rng: np.random.Generator
+) -> Rows:
     return rows[:n]
 
 
-def uniform_random(rows: Rows, n: int, rng: np.random.Generator) -> Rows:
+def uniform_random(
+    bag: Bag, rows: Rows, n: int, settings: SamplingConfig, rng: np.random.Generator
+) -> Rows:
     return np.sort(rng.choice(rows, size=n, replace=False))
+
+
+def least_background(
+    bag: Bag, rows: Rows, n: int, settings: SamplingConfig, rng: np.random.Generator
+) -> Rows:
+    """The n tiles with the highest tissue fraction; ties are broken at random."""
+    if n >= len(rows):
+        return rows
+    scores = tissue_fractions(bag, rows, settings.background_cutoff)
+    shuffled = rng.permutation(len(rows))
+    best = shuffled[np.argsort(-scores[shuffled], kind="stable")[:n]]
+    return np.sort(rows[best])
+
+
+def tissue_fractions(bag: Bag, rows: Rows, cutoff: int) -> npt.NDArray[np.float64]:
+    """Fraction of non-background pixels of each tile (one slide's rows)."""
+    slide = bag.slides[int(bag.slide_idx[rows[0]])]
+    if slide.cache_file is None:
+        raise ValueError(
+            f"{slide.slide_id}: strategy 'tissue' needs the tile images, but this "
+            "slide's features were imported without a tile cache"
+        )
+    reader = TileReader()
+    try:
+        return np.array(
+            [
+                tissue_fraction(reader.read(slide.cache_file, (x, y)), cutoff)
+                for x, y in bag.coords_slide[rows].tolist()
+            ]
+        )
+    finally:
+        reader.close()
+
+
+def tissue_fraction(tile: Image.Image, cutoff: int) -> float:
+    """Share of pixels whose grey value is below `cutoff` (computed on a 4x
+    smaller copy: enough for a fraction, and much faster)."""
+    grey = np.asarray(tile.convert("L").reduce(4))
+    return float((grey < cutoff).mean())
 
 
 SAMPLERS: dict[SamplingStrategy, Sampler] = {
     "first_n": first_n,
     "random": uniform_random,
+    "tissue": least_background,
 }
 
 
@@ -84,7 +132,7 @@ def sample_bag(bag: Bag, settings: SamplingConfig, rng: np.random.Generator) -> 
     sampler = SAMPLERS[settings.strategy]
     chosen = np.concatenate(
         [
-            sampler(rows, int(n), rng)
+            sampler(bag, rows, int(n), settings, rng)
             for rows, n in zip(rows_per_slide, quota, strict=True)
             if n > 0
         ]
