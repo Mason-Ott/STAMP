@@ -891,3 +891,69 @@ def test_per_slide_encoding_with_chunks_averages_chunks_within_each_slide(
         len(b.distinct_tiles()[0]) for b in bags.values()
     )
     assert len(calls) > sum(SLIDE_COUNTS.values()), "some slides needed chunks"
+
+
+class DamagedSlide:
+    """A slide whose coarse layers can't be read, like a partly corrupt scan."""
+
+    level_count = 3
+    level_dimensions = ((4096, 3072), (1024, 768), (256, 192))
+    level_downsamples = (1.0, 4.0, 16.0)
+    readable = (0, 1)
+
+    def get_thumbnail(self, size):
+        from openslide import OpenSlideError
+
+        raise OpenSlideError("Not a JPEG file: starts with 0x11 0x00")
+
+    def read_region(self, location, level, size):
+        from openslide import OpenSlideError
+        from PIL import Image
+
+        if level not in self.readable:
+            raise OpenSlideError("Not a JPEG file: starts with 0x11 0x00")
+        return Image.new("RGBA", size, (200, 30, 30, 255))
+
+    def close(self):
+        pass
+
+
+def test_thumbnail_of_a_slide_with_damaged_layers_comes_from_a_readable_one(
+    monkeypatch,
+):
+    from stamp.preprocessing.slides import overview
+
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: DamagedSlide())
+    thumbnail = overview._thumbnail_from_readable_level("any.svs", 512)
+    assert thumbnail.size == (512, 384), "aspect ratio kept, fitted to 512"
+    red = np.asarray(thumbnail)[..., 0]
+    assert red.min() > 150, "filled from layer 1 (the coarsest that reads)"
+
+
+def test_a_piece_that_cannot_be_read_stays_white(monkeypatch):
+    from openslide import OpenSlideError
+
+    from stamp.preprocessing.slides import overview
+
+    class OneBadPiece(DamagedSlide):
+        def read_region(self, location, level, size):
+            if level == 1 and location[0] == 0:
+                raise OpenSlideError("bad tile")
+            return super().read_region(location, level, size)
+
+    monkeypatch.setattr(overview, "CHUNK_PX", 512)
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: OneBadPiece())
+    # probing level 1 hits the bad piece at (0, 0), so it falls back to level 0
+    thumbnail = overview._thumbnail_from_readable_level("any.svs", 512)
+    assert thumbnail.size == (512, 384)
+
+
+def test_a_slide_with_no_readable_layer_is_an_error(monkeypatch):
+    from stamp.preprocessing.slides import overview
+
+    class Unreadable(DamagedSlide):
+        readable = ()
+
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: Unreadable())
+    with pytest.raises(RuntimeError, match="no layer"):
+        overview._thumbnail_from_readable_level("any.svs", 512)
