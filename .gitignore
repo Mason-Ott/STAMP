@@ -3,6 +3,10 @@ docker-compose.yml
 Dockerfile
 /config.yaml
 
+# Your own run configs (paths, host names) and generated sweep configs.
+# src/stamp/config.yaml is the shared template: keep placeholders in it.
+/configs/
+
 # Binary files and model weights
 *.bin
 *.pt
