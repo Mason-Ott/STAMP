@@ -26,7 +26,8 @@ STEP_SUMMARY = {
     StepName.COMBINE: "slides -> one bag per patient (slides laid side by side)",
     StepName.SAMPLE: "patient bag -> at most n_tiles tiles",
     StepName.EXTRACT: "sampled tile positions -> tile features",
-    StepName.ENCODE: "patient features -> one embedding per patient",
+    StepName.ENCODE: "patient features -> one embedding per patient (or per slide)",
+    StepName.AGGREGATE: "a patient's slide embeddings -> one (mean, max or concat)",
 }
 
 STRATEGY_SUMMARY = {
@@ -180,7 +181,20 @@ def _step_settings(
                 f"pad_mode {sampling.pad_mode}"
             )
         case StepName.ENCODE:
-            return f"encoder {cfg.encoder}"
+            text = f"encoder {cfg.encoder}"
+            if cfg.encoding.slide_aggregation is not None:
+                text += ", each slide on its own"
+            if cfg.encoding.chunk_size is not None:
+                text += (
+                    f", chunks of {cfg.encoding.chunk_size} tiles "
+                    f"(seed {cfg.encoding.seed})"
+                )
+            return text
+        case StepName.AGGREGATE:
+            text = f"{cfg.encoding.slide_aggregation} over the slides"
+            if cfg.encoding.max_slides is not None:
+                text += f", padded to {cfg.encoding.max_slides} slides"
+            return text
     return ""
 
 

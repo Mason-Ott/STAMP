@@ -18,6 +18,9 @@ Results are organised by experiment and run:
             sampled_features/            extract_then_sample: the sampled tiles
             features/                    training bags (sampled tiles with features)
             embeddings/<encoder>/        one embedding per patient (with an encoder)
+                chunk<n>-seed<k>/            with encoding.chunk_size (below it)
+                slides_<mean|max|concat<k>>/ with slide_aggregation (below that)
+            slide_embeddings/<encoder>/  per-slide encoding: one per slide
             overviews/                   sampling thumbnails (save_visualisations)
             logs/                        worker logs
 
@@ -48,8 +51,13 @@ from stamp.preprocessing.config import PreprocessingConfig
 from stamp.preprocessing.data.clinical import Patient, Slide
 from stamp.preprocessing.extractor import Extractor
 from stamp.preprocessing.pipeline import describe
-from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
+from stamp.preprocessing.pipeline.config import (
+    ENCODING_STEPS,
+    PipelineConfig,
+    StepName,
+)
 from stamp.preprocessing.steps import (
+    aggregate,
     combine,
     encode,
     extract,
@@ -110,12 +118,13 @@ class Layout:
     @property
     def training_bags(self) -> Path:
         """The run's `features` folder: the last stage before encoding."""
-        return [s for s in self.stages if s.step != StepName.ENCODE][-1].folder
+        return [s for s in self.stages if s.step not in ENCODING_STEPS][-1].folder
 
     @property
     def embeddings(self) -> Path | None:
-        encoding = [s for s in self.stages if s.step == StepName.ENCODE]
-        return encoding[0].folder if encoding else None
+        """The final embeddings: the last encoding stage's folder."""
+        encoding = [s for s in self.stages if s.step in ENCODING_STEPS]
+        return encoding[-1].folder if encoding else None
 
 
 def run_name(pre: PreprocessingConfig, cfg: PipelineConfig) -> str:
@@ -135,12 +144,12 @@ def active_steps(pre: PreprocessingConfig, cfg: PipelineConfig) -> list[StepName
     steps = cfg.default_steps()
     if encoding_possible(pre, cfg):
         return steps
-    return [s for s in steps if s != StepName.ENCODE]
+    return [s for s in steps if s not in ENCODING_STEPS]
 
 
 def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
     steps = active_steps(pre, cfg)
-    last_data_step = [s for s in steps if s != StepName.ENCODE][-1]
+    last_data_step = [s for s in steps if s not in ENCODING_STEPS][-1]
     extractor = str(pre.extractor)
     base = _base_tag(pre, cfg)
     patient = f"{base}_gap{cfg.virtual_gap_tiles}"
@@ -158,8 +167,8 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
             StepName.EXTRACT,
         )
         shared = False
-        if step == StepName.ENCODE:
-            folder = run_dir / "embeddings" / str(cfg.encoder)
+        if step in ENCODING_STEPS:
+            folder = _embedding_folder(step, cfg, run_dir)
         elif step == last_data_step:
             folder = run_dir / "features"
         elif step == StepName.SAMPLE:
@@ -176,7 +185,7 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
                 step=step,
                 folder=folder,
                 per_slide=step in SLIDE_STEPS,
-                kept=step in (last_data_step, StepName.ENCODE),
+                kept=step == last_data_step or step in ENCODING_STEPS,
                 shared=shared,
             )
         )
@@ -187,6 +196,20 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
         tile_overviews=shared_dir / "overviews" / "tiles" / base,
         sampling_overviews=run_dir / "overviews",
     )
+
+
+def _embedding_folder(step: StepName, cfg: PipelineConfig, run_dir: Path) -> Path:
+    """Where an encoding step writes, inside the run: `embeddings/<encoder>` (or
+    `slide_embeddings/<encoder>` for per-slide encoding), then `chunk<n>-seed<k>`
+    with chunking, and for the aggregate step `slides_<aggregation>`."""
+    per_slide = cfg.encoding.slide_aggregation is not None
+    top = "slide_embeddings" if per_slide and step == StepName.ENCODE else "embeddings"
+    folder = run_dir / top / str(cfg.encoder)
+    if cfg.encoding.tag is not None:
+        folder /= cfg.encoding.tag
+    if step == StepName.AGGREGATE:
+        folder /= str(cfg.encoding.aggregation_tag)
+    return folder
 
 
 def _shared_folder(
@@ -265,7 +288,7 @@ def build_plan(
         previous = layout.stages[index - 1] if index > 0 else None
         # Later stages whose files show this item was consumed. Encoding never
         # deletes its input, so its output doesn't count.
-        later = [s for s in layout.stages[index + 1 :] if s.step != StepName.ENCODE]
+        later = [s for s in layout.stages[index + 1 :] if s.step not in ENCODING_STEPS]
 
         def inputs_of(
             item: Slide | Patient,
@@ -340,11 +363,21 @@ def _runners(
         StepName.EXTRACT: partial(
             extract.run, extractor=models.extractor, settings=extraction
         ),
+        StepName.AGGREGATE: partial(
+            aggregate.run,
+            settings=aggregate.AggregationSettings(
+                method=cfg.encoding.slide_aggregation or "mean",
+                max_slides=cfg.encoding.max_slides,
+            ),
+        ),
         StepName.ENCODE: partial(
             encode.run,
             encoder=models.encoder,
             settings=encode.EncodingSettings(
-                device=cfg.encoder_device or str(pre.device)
+                device=cfg.encoder_device or str(pre.device),
+                chunk_size=cfg.encoding.chunk_size,
+                seed=cfg.encoding.seed,
+                per_slide=cfg.encoding.slide_aggregation is not None,
             ),
         ),
     }

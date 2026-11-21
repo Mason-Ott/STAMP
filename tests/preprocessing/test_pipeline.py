@@ -1,5 +1,6 @@
 """End-to-end runs on synthetic slides, with a fake extractor and encoder."""
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -666,3 +667,227 @@ def test_tissue_sampling_keeps_the_tiles_with_the_least_background(
             assert min(score[c] for c in kept) >= max(dropped), (key, slide.slide_id)
     assert checked, "the test needs a slide with more tiles than its quota"
     reader.close()
+
+
+def test_chunked_encoding_averages_chunk_embeddings_of_all_tiles(
+    make_configs, fake_models
+):
+    pre, cfg = make_configs(
+        "chunked",
+        encoder="titan",
+        extractor="conch1_5",
+        sampling={"enabled": False},
+        encoding={"chunk_size": 20, "seed": 3},
+    )
+    reports = run_pipeline_(pre, cfg, models=fake_models)
+    assert all(r.ok for r in reports.values()), reports
+
+    layout = layout_for(pre, cfg)
+    assert layout.embeddings.name == "chunk20-seed3"
+    bags = read_folder(layout.training_bags)
+    calls = fake_models.encoder.get().calls
+    assert all(len(feats) <= 20 for feats, _ in calls)
+
+    # Every tile of every patient goes through the encoder exactly once.
+    assert sum(len(feats) for feats, _ in calls) == sum(
+        len(bag.distinct_tiles()[0]) for bag in bags.values()
+    )
+    big = max(bags.values(), key=len)
+    assert len(big.distinct_tiles()[0]) > 20, "the test needs a patient with chunks"
+
+    for key, bag in bags.items():
+        with h5py.File(layout.embeddings / f"{key}.h5") as f:
+            embedding, n_chunks = f["feats"][:], f.attrs["n_chunks"]
+        rows, _ = bag.distinct_tiles()
+        assert n_chunks == -(-len(rows) // 20)
+        # fake embedding = mean tile feature; mean of equal-size chunk means
+        # is the mean over all tiles when chunks have equal size, else close to it
+        np.testing.assert_allclose(
+            embedding, bag.feats[rows].mean(0), rtol=0.05, atol=0.05
+        )
+
+
+def test_chunks_are_random_but_reproducible_and_cover_the_bag(sample_then_extract):
+    from stamp.preprocessing.steps.encode import EncodingSettings, chunks_of
+
+    bag = next(b for b in sample_then_extract["bags"].values() if len(b) > 40)
+    rows = bag.distinct_tiles()[0]
+    settings = EncodingSettings(device="cpu", chunk_size=25, seed=1)
+    chunks = chunks_of(bag, settings)
+    again = chunks_of(bag, settings)
+    other = chunks_of(bag, EncodingSettings(device="cpu", chunk_size=25, seed=2))
+    assert all(len(c) <= 25 for c in chunks)
+    assert sorted(np.concatenate(chunks)) == sorted(rows)
+    assert all(np.array_equal(a, b) for a, b in zip(chunks, again, strict=True))
+    assert not all(np.array_equal(a, b) for a, b in zip(chunks, other, strict=True))
+    whole = chunks_of(bag, EncodingSettings(device="cpu", chunk_size=10**6))
+    assert len(whole) == 1 and np.array_equal(whole[0], rows)
+
+
+def test_chunking_settings_name_the_embedding_folder(make_configs):
+    base_pre, base_cfg = make_configs("x", encoder="titan", extractor="conch1_5")
+    pre, cfg = make_configs(
+        "x", encoder="titan", extractor="conch1_5", encoding={"chunk_size": 100}
+    )
+    base, chunked = folder_names(base_pre, base_cfg), folder_names(pre, cfg)
+    assert chunked[:-1] == base[:-1], "only the embeddings differ"
+    assert chunked[-1] == f"{base[-1]}/chunk100-seed0"
+
+    with pytest.raises(ValueError, match="need pipeline.encoder"):
+        make_configs("x", encoding={"chunk_size": 100})
+
+
+SLIDE_COUNTS = {"H1_P1": 2, "H1_P2": 2, "H2_P1": 1}
+
+
+def per_slide_run(make_configs, fake_models, name, **encoding):
+    pre, cfg = make_configs(
+        name,
+        encoder="titan",
+        extractor="conch1_5",
+        sampling={"enabled": False},
+        encoding=encoding,
+    )
+    reports = run_pipeline_(pre, cfg, models=fake_models)
+    assert all(r.ok for r in reports.values()), reports
+    return pre, cfg
+
+
+def read_embeddings(folder: Path) -> dict[str, np.ndarray]:
+    result = {}
+    for path in sorted(folder.glob("*.h5")):
+        with h5py.File(path) as f:
+            result[path.stem] = f["feats"][:]
+    return result
+
+
+def test_per_slide_embeddings_are_aggregated(make_configs, fake_models):
+    pre, cfg = per_slide_run(
+        make_configs, fake_models, "slides", slide_aggregation="mean"
+    )
+    layout = layout_for(pre, cfg)
+    assert layout.stage(StepName.ENCODE).folder.parts[-2] == "slide_embeddings"
+    assert layout.embeddings.name == "slides_mean"
+
+    calls = fake_models.encoder.get().calls
+    assert len(calls) == sum(SLIDE_COUNTS.values()), "one encoder call per slide"
+    bags = read_folder(layout.training_bags)
+
+    with h5py.File(layout.stage(StepName.ENCODE).folder / "H1_P1.h5") as f:
+        slide_feats = f["slide_feats"][:]
+        assert json.loads(f.attrs["slide_ids"]) == ["S1", "S2"]
+    assert slide_feats.shape == (2, FEATURE_DIM)
+    # fake embedding = mean tile feature of the slide's own tiles
+    bag = bags["H1_P1"]
+    for k, row in enumerate(slide_feats):
+        np.testing.assert_allclose(
+            row, bag.feats[bag.slide_idx == k].mean(0), rtol=1e-2, atol=1e-3
+        )
+
+    embeddings = read_embeddings(layout.embeddings)
+    assert set(embeddings) == set(SLIDE_COUNTS)
+    np.testing.assert_allclose(embeddings["H1_P1"], slide_feats.mean(0), rtol=1e-5)
+    with h5py.File(layout.embeddings / "H1_P1.h5") as f:
+        assert f.attrs["feat_type"] == "patient" and f.attrs["n_slides"] == 2
+        assert f.attrs["slide_aggregation"] == "mean"
+
+
+def test_trying_another_aggregation_only_reruns_the_aggregate_step(
+    make_configs, fake_models
+):
+    pre, cfg = per_slide_run(make_configs, fake_models, "agg", slide_aggregation="mean")
+    n_calls = len(fake_models.encoder.get().calls)
+    first = layout_for(pre, cfg)
+
+    other = cfg.model_copy(
+        update={
+            "encoding": cfg.encoding.model_copy(update={"slide_aggregation": "max"})
+        }
+    )
+    reports = run_pipeline_(pre, other, models=fake_models)
+    assert reports[StepName.ENCODE].done == 0 and reports[StepName.AGGREGATE].done == 3
+    assert len(fake_models.encoder.get().calls) == n_calls, "nothing re-encoded"
+
+    second = layout_for(pre, other)
+    assert second.stage(StepName.ENCODE).folder == first.stage(StepName.ENCODE).folder
+    assert second.embeddings != first.embeddings
+    with h5py.File(first.stage(StepName.ENCODE).folder / "H1_P1.h5") as f:
+        slide_feats = f["slide_feats"][:]
+    np.testing.assert_array_equal(
+        read_embeddings(second.embeddings)["H1_P1"], slide_feats.max(0)
+    )
+    np.testing.assert_allclose(
+        read_embeddings(first.embeddings)["H1_P1"], slide_feats.mean(0), rtol=1e-5
+    )
+
+
+def test_concatenated_slide_embeddings_are_padded_to_max_slides(
+    make_configs, fake_models
+):
+    pre, cfg = per_slide_run(
+        make_configs,
+        fake_models,
+        "concat",
+        slide_aggregation="concat",
+        max_slides=3,
+    )
+    layout = layout_for(pre, cfg)
+    assert layout.embeddings.name == "slides_concat3"
+    embeddings = read_embeddings(layout.embeddings)
+    assert {e.shape for e in embeddings.values()} == {(3 * FEATURE_DIM,)}
+    with h5py.File(layout.stage(StepName.ENCODE).folder / "H1_P1.h5") as f:
+        slide_feats = f["slide_feats"][:]
+    np.testing.assert_array_equal(
+        embeddings["H1_P1"],
+        np.concatenate([slide_feats.reshape(-1), np.zeros(FEATURE_DIM)]),
+    )
+    single = embeddings["H2_P1"].reshape(3, FEATURE_DIM)
+    assert single[0].any() and not single[1:].any()
+
+
+def test_too_few_slide_slots_is_rejected_before_anything_runs(
+    make_configs, fake_models
+):
+    pre, cfg = make_configs(
+        "slots",
+        encoder="titan",
+        extractor="conch1_5",
+        encoding={"slide_aggregation": "concat", "max_slides": 1},
+    )
+    with pytest.raises(ValueError, match="more than encoding.max_slides"):
+        run_pipeline_(pre, cfg, models=fake_models)
+    assert not (pre.output_dir / "slide_embeddings").exists()
+
+
+def test_slide_aggregation_settings_are_validated(make_configs):
+    with pytest.raises(ValueError, match="max_slides is needed for"):
+        make_configs("x", encoder="titan", encoding={"slide_aggregation": "concat"})
+    with pytest.raises(ValueError, match="only for"):
+        make_configs(
+            "x",
+            encoder="titan",
+            encoding={"slide_aggregation": "mean", "max_slides": 2},
+        )
+    with pytest.raises(ValueError, match="need pipeline.encoder"):
+        make_configs("x", encoding={"slide_aggregation": "mean"})
+
+
+def test_per_slide_encoding_with_chunks_averages_chunks_within_each_slide(
+    make_configs, fake_models
+):
+    pre, cfg = per_slide_run(
+        make_configs,
+        fake_models,
+        "slide_chunks",
+        slide_aggregation="mean",
+        chunk_size=15,
+    )
+    layout = layout_for(pre, cfg)
+    assert layout.embeddings.parts[-2:] == ("chunk15-seed0", "slides_mean")
+    calls = fake_models.encoder.get().calls
+    assert all(len(feats) <= 15 for feats, _ in calls)
+    bags = read_folder(layout.training_bags)
+    assert sum(len(f) for f, _ in calls) == sum(
+        len(b.distinct_tiles()[0]) for b in bags.values()
+    )
+    assert len(calls) > sum(SLIDE_COUNTS.values()), "some slides needed chunks"

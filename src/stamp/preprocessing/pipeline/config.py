@@ -45,7 +45,17 @@ class StepName(StrEnum):
     """patient tile positions -> patient features"""
 
     ENCODE = "encode"
-    """patient features -> one embedding per patient (e.g. TITAN)"""
+    """patient features -> one embedding per patient (e.g. TITAN); with
+    encoding.slide_aggregation, one embedding per slide"""
+
+    AGGREGATE = "aggregate"
+    """a patient's slide embeddings -> one embedding (mean, max or concatenation)"""
+
+
+ENCODING_STEPS = (StepName.ENCODE, StepName.AGGREGATE)
+"""Steps after the training bags; their outputs are embeddings."""
+
+SlideAggregation = Literal["mean", "max", "concat"]
 
 
 SamplingStrategy = Literal[
@@ -143,6 +153,57 @@ class SamplingConfig(BaseModel):
         return "-".join(parts)
 
 
+class EncodingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_size: int | None = Field(default=None, gt=0)
+    """None: encode the patient's whole bag in one go.
+    Otherwise: split a patient with more than chunk_size tiles into random chunks
+    of at most that size, encode each chunk, and average the chunk embeddings.
+    The result has the encoder's fixed size however many tiles the patient has,
+    so every tile can be used (set sampling.enabled: false)."""
+
+    seed: int = 0
+    """Which tiles go into which chunk."""
+
+    slide_aggregation: SlideAggregation | None = None
+    """None: a patient's slides are encoded together, as one virtual slide.
+    Otherwise each slide is encoded on its own (chunked within the slide if
+    chunk_size is set), and the patient's slide embeddings are combined by
+    mean: the average; max: element-wise maximum; concat: one after the other
+    (slide order = sorted slide ids), zero-padded to `max_slides` slides.
+    The per-slide embeddings are kept, so trying another aggregation only
+    reruns the cheap `aggregate` step."""
+
+    max_slides: int | None = Field(default=None, gt=0)
+    """concat only: the embedding has max_slides * (encoder size) numbers.
+    Must be at least the largest number of slides of any patient."""
+
+    @model_validator(mode="after")
+    def _check(self) -> "EncodingConfig":
+        if (self.slide_aggregation == "concat") != (self.max_slides is not None):
+            raise ValueError(
+                "encoding.max_slides is needed for, and only for, "
+                "slide_aggregation: concat"
+            )
+        return self
+
+    @property
+    def tag(self) -> str | None:
+        """Folder name for embeddings made with these chunk settings, None if whole."""
+        if self.chunk_size is None:
+            return None
+        return f"chunk{self.chunk_size}-seed{self.seed}"
+
+    @property
+    def aggregation_tag(self) -> str | None:
+        if self.slide_aggregation is None:
+            return None
+        if self.slide_aggregation == "concat":
+            return f"slides_concat{self.max_slides}"
+        return f"slides_{self.slide_aggregation}"
+
+
 class ClinicalColumns(BaseModel):
     """Accepted column names for each field of the clinical table, in priority order."""
 
@@ -193,6 +254,8 @@ class PipelineConfig(BaseModel):
 
     encoder: EncoderName | None = None
     """Optional slide encoder (e.g. titan) run on each patient's bag."""
+
+    encoding: EncodingConfig = EncodingConfig()
 
     encoder_device: str | None = None
     """Device for the encoder. Default: preprocessing.device."""
@@ -247,6 +310,14 @@ class PipelineConfig(BaseModel):
                 "slide_feat_dir only applies to order: extract_then_sample"
             )
         check_sampling(self)
+        if self.encoder is None and (
+            self.encoding.chunk_size is not None
+            or self.encoding.slide_aggregation is not None
+        ):
+            raise ValueError(
+                "encoding.chunk_size and encoding.slide_aggregation need "
+                "pipeline.encoder"
+            )
         if self.steps is not None:
             check_steps(self, self.steps)
         return self
@@ -268,14 +339,20 @@ class PipelineConfig(BaseModel):
             steps.remove(StepName.SAMPLE)
         if self.encoder is not None:
             steps.append(StepName.ENCODE)
+            if self.encoding.slide_aggregation is not None:
+                steps.append(StepName.AGGREGATE)
         return steps
 
 
 def check_steps(cfg: PipelineConfig, steps: Sequence[StepName]) -> None:
     """Reject steps that don't belong to the configured order, before anything runs."""
     allowed = set(cfg.default_steps())
-    if cfg.encoder is None and StepName.ENCODE in steps:
-        raise ValueError("step 'encode' needs pipeline.encoder (e.g. titan)")
+    if cfg.encoder is None and (
+        step := next((s for s in steps if s in ENCODING_STEPS), None)
+    ):
+        raise ValueError(f"step '{step}' needs pipeline.encoder (e.g. titan)")
+    if StepName.AGGREGATE in steps and cfg.encoding.slide_aggregation is None:
+        raise ValueError("step 'aggregate' needs pipeline.encoding.slide_aggregation")
     if StepName.SAMPLE in steps and not cfg.sampling.enabled:
         raise ValueError("step 'sample' needs pipeline.sampling.enabled: true")
     if bad := [str(s) for s in steps if s not in allowed]:
