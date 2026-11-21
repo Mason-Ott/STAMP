@@ -14,6 +14,9 @@ E the extractor and S the sampling settings (e.g. `first_n-8192`, or `full`):
     sampled_positions/G/S/<patient>.h5     the sampled tile positions
     features/E/G/S/<patient>.h5            sampled tiles with features  <- training
     embeddings/<encoder>/E/G/S/<patient>.h5   one embedding per patient
+    (per-slide encoding: slide_embeddings/... holds one per slide, and
+    embeddings/.../slides_<mean|max|concat<k>>/ the aggregated embedding)
+    (with encoding.chunk_size: embeddings/<encoder>/E/G/S/chunk<n>-seed<k>/)
 
 extract_then_sample uses `slide_features/E/T`, `patient_features/E/G` and
 `sampled_features/E/G/S` instead of the positions folders, and ends in the
@@ -41,8 +44,13 @@ from stamp.encoding.encoder import Encoder
 from stamp.preprocessing.config import PreprocessingConfig
 from stamp.preprocessing.data.clinical import Patient, Slide
 from stamp.preprocessing.extractor import Extractor
-from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
+from stamp.preprocessing.pipeline.config import (
+    ENCODING_STEPS,
+    PipelineConfig,
+    StepName,
+)
 from stamp.preprocessing.steps import (
+    aggregate,
     combine,
     encode,
     extract,
@@ -91,12 +99,13 @@ class Layout:
     @property
     def training_bags(self) -> Path:
         """The `features/...` folder: the last stage before encoding."""
-        return [s for s in self.stages if s.step != StepName.ENCODE][-1].folder
+        return [s for s in self.stages if s.step not in ENCODING_STEPS][-1].folder
 
     @property
     def embeddings(self) -> Path | None:
-        encoding = [s for s in self.stages if s.step == StepName.ENCODE]
-        return encoding[0].folder if encoding else None
+        """The final embeddings: the last encoding stage's folder."""
+        encoding = [s for s in self.stages if s.step in ENCODING_STEPS]
+        return encoding[-1].folder if encoding else None
 
 
 def encoding_possible(pre: PreprocessingConfig, cfg: PipelineConfig) -> bool:
@@ -110,12 +119,12 @@ def active_steps(pre: PreprocessingConfig, cfg: PipelineConfig) -> list[StepName
     steps = cfg.default_steps()
     if encoding_possible(pre, cfg):
         return steps
-    return [s for s in steps if s != StepName.ENCODE]
+    return [s for s in steps if s not in ENCODING_STEPS]
 
 
 def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
     steps = active_steps(pre, cfg)
-    last_data_step = [s for s in steps if s != StepName.ENCODE][-1]
+    last_data_step = [s for s in steps if s not in ENCODING_STEPS][-1]
     extractor = str(pre.extractor)
     base = _base_tag(pre, cfg)
     patient = f"{base}_gap{cfg.virtual_gap_tiles}"
@@ -129,10 +138,8 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
             StepName.EXTRACT_SLIDES,
             StepName.EXTRACT,
         )
-        if step == StepName.ENCODE:
-            relative = Path(
-                "embeddings", str(cfg.encoder), extractor, patient, sampling
-            )
+        if step in ENCODING_STEPS:
+            relative = _embedding_folder(step, cfg, extractor, patient, sampling)
         elif step == last_data_step:
             relative = Path("features", extractor, patient, sampling)
         else:
@@ -142,7 +149,7 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
                 step=step,
                 folder=pre.output_dir / relative,
                 per_slide=step in SLIDE_STEPS,
-                kept=step in (last_data_step, StepName.ENCODE),
+                kept=step == last_data_step or step in ENCODING_STEPS,
             )
         )
     return Layout(
@@ -155,6 +162,24 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
         / patient
         / sampling,
     )
+
+
+def _embedding_folder(
+    step: StepName,
+    cfg: PipelineConfig,
+    extractor: str,
+    patient: str,
+    sampling: str,
+) -> Path:
+    """`[slide_]embeddings/<encoder>/E/G/S[/chunk...][/slides_<aggregation>]`"""
+    per_slide = cfg.encoding.slide_aggregation is not None
+    top = "slide_embeddings" if per_slide and step == StepName.ENCODE else "embeddings"
+    relative = Path(top, str(cfg.encoder), extractor, patient, sampling)
+    if cfg.encoding.tag is not None:
+        relative /= cfg.encoding.tag
+    if step == StepName.AGGREGATE:
+        relative /= str(cfg.encoding.aggregation_tag)
+    return relative
 
 
 def _folder(
@@ -242,7 +267,7 @@ def build_plan(
         previous = layout.stages[index - 1] if index > 0 else None
         # Later stages whose files show this item was consumed. Encoding never
         # deletes its input, so its output doesn't count.
-        later = [s for s in layout.stages[index + 1 :] if s.step != StepName.ENCODE]
+        later = [s for s in layout.stages[index + 1 :] if s.step not in ENCODING_STEPS]
 
         def inputs_of(
             item: Slide | Patient,
@@ -317,11 +342,21 @@ def _runners(
         StepName.EXTRACT: partial(
             extract.run, extractor=models.extractor, settings=extraction
         ),
+        StepName.AGGREGATE: partial(
+            aggregate.run,
+            settings=aggregate.AggregationSettings(
+                method=cfg.encoding.slide_aggregation or "mean",
+                max_slides=cfg.encoding.max_slides,
+            ),
+        ),
         StepName.ENCODE: partial(
             encode.run,
             encoder=models.encoder,
             settings=encode.EncodingSettings(
-                device=cfg.encoder_device or str(pre.device)
+                device=cfg.encoder_device or str(pre.device),
+                chunk_size=cfg.encoding.chunk_size,
+                seed=cfg.encoding.seed,
+                per_slide=cfg.encoding.slide_aggregation is not None,
             ),
         ),
     }
@@ -361,6 +396,7 @@ def run_settings(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, Any
         if cfg.slide_feat_dir is None
         else str(cfg.slide_feat_dir),
         "encoder": None if cfg.encoder is None else str(cfg.encoder),
+        "encoding": cfg.encoding.model_dump(mode="json"),
     }
 
 
