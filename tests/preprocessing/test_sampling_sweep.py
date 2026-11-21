@@ -345,3 +345,87 @@ def test_start_runs_end_to_end_and_records_the_helpers(tmp_path, monkeypatch, ca
     }
     assert loaded["texture"].hosts == ["h2", "h3"]
     assert loaded["entropy"].hosts == ["h1", "h4"]
+
+
+def test_helpers_are_capped_by_the_limit():
+    variants = sweep.plan_variants(BASE, ["entropy", "texture"], 1024, ["h1", "h2"])
+    started = []
+
+    def starter(variant, host):
+        started.append(host)
+        return "started"
+
+    helpers = sweep.add_helpers(variants, ["s1", "s2", "s3", "s4"], starter, limit=3)
+    assert started == ["s1", "s2", "s3"] and sum(map(len, helpers.values())) == 3
+    assert sweep.add_helpers(variants, ["s1"], starter, limit=0) == {
+        "entropy": [],
+        "texture": [],
+    }
+
+
+def test_the_host_report_groups_hosts_and_says_what_to_do():
+    problems = {
+        "ok1": None,
+        "gone": "ssh: Could not resolve hostname gone: Name or service not known",
+        "moved": "Host key verification failed.",
+        "pw1": "mot30@pw1: Permission denied (publickey,password).",
+        "pw2": "mot30@pw2: Permission denied (publickey,password).",
+        "slow": "timed out",
+    }
+    text = "\n".join(sweep.host_report(list(problems), problems))
+    assert "6 hosts in the pool" in text
+    assert "works: 1" in text and "needs a password: 2" in text
+    assert "no such host: 1" in text and "host key changed: 1" in text
+    assert "other: 1" in text
+    assert "pw1 pw2" in text and "--no-prompt" in text and "ssh-keygen -R" in text
+
+
+def test_hosts_action_prints_the_report(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    monkeypatch.setattr(
+        sweep,
+        "check_hosts",
+        lambda hosts: {h: None if h == "h1" else "timed out" for h in hosts},
+    )
+    out = run_main(monkeypatch, capsys, str(base), "hosts")
+    assert "works: 1" in out and "other: 2" in out
+
+
+def test_start_without_prompts_uses_only_hosts_that_work(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+    seen = []
+
+    def fake_start(run, hosts, worker_args=(), *, interactive=False):
+        seen.append((hosts[0], interactive))
+        return {hosts[0]: "started"}
+
+    monkeypatch.setattr(sweep, "start", fake_start)
+    monkeypatch.setattr(
+        sweep,
+        "check_hosts",
+        lambda hosts: {
+            h: None if h in {"w1", "w2", "w3", "w4"} else "Permission denied"
+            for h in hosts
+        },
+    )
+    out = run_main(
+        monkeypatch,
+        capsys,
+        str(base),
+        "start",
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--hosts", "p1", "w1", "p2", "w2", "w3", "p3", "w4",
+        "--no-prompt",
+        "--max-hosts", "3",
+        "--out-dir", str(out_dir),
+    )  # fmt: skip
+    assert "4 of 7 hosts accept a passwordless login" in out
+    hosts = [host for host, _ in seen]
+    assert hosts == ["w1", "w2", "w3"], (
+        "two runs plus one helper, no skipped host tried"
+    )
+    assert not any(interactive for _, interactive in seen), "never asks for a password"

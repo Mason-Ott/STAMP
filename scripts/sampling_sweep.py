@@ -209,18 +209,21 @@ def add_helpers(
     spares: list[str],
     starter: Callable[[Variant, str], str],
     report: Callable[[str, str], None] = lambda host, outcome: None,
+    limit: int | None = None,
 ) -> dict[str, list[str]]:
     """Let the spare hosts help the runs that have a host, most expensive run
     first, taking turns. A helper runs the same config next to the run's own
     worker: they share the work through lock files, so each item (patient, slide)
-    is done once, by whoever gets there first. A host that fails is skipped.
+    is done once, by whoever gets there first. A host that fails is skipped. At
+    most `limit` helpers are started (None: as many as there are spare hosts).
     Returns strategy -> helper hosts."""
     ranked = sorted(placed, key=lambda v: COST_ORDER.index(v.strategy))
     helpers: dict[str, list[str]] = {v.strategy: [] for v in ranked}
     for host in spares:
-        if not ranked:
+        n_helpers = sum(map(len, helpers.values()))
+        if not ranked or (limit is not None and n_helpers >= limit):
             break
-        target = ranked[sum(map(len, helpers.values())) % len(ranked)]
+        target = ranked[n_helpers % len(ranked)]
         outcome = starter(target, host)
         if is_failure(outcome):
             report(host, outcome)
@@ -275,7 +278,7 @@ def check_hosts(hosts: list[str]) -> dict[str, str | None]:
 def parallel[T, R](function: Callable[[T], R], items: list[T]) -> list[R]:
     if not items:
         return []
-    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(items), 32)) as pool:
         return list(pool.map(function, items))
 
 
@@ -307,6 +310,47 @@ def print_plan(variants: list[Variant], out_dir: Path) -> None:
         print(f"  {variant.strategy:<13} {variant.host:<12} steps: {variant.steps}")
 
 
+def host_report(pool: list[str], problems: dict[str, str | None]) -> list[str]:
+    """Lines saying which pool hosts work without a password and why the others
+    don't, with what to do about each group."""
+    groups: dict[str, list[str]] = {
+        "works": [],
+        "no such host": [],
+        "host key changed": [],
+        "needs a password": [],
+        "other": [],
+    }
+    for host in pool:
+        why = problems[host]
+        if why is None:
+            groups["works"].append(host)
+        elif "resolve" in why.lower():
+            groups["no such host"].append(host)
+        elif "host key verification failed" in why.lower():
+            groups["host key changed"].append(host)
+        elif "permission denied" in why.lower():
+            groups["needs a password"].append(host)
+        else:
+            groups["other"].append(host)
+    advice = {
+        "no such host": "remove from the pool",
+        "host key changed": "the machine may have been reinstalled: once you are sure, "
+        "`ssh-keygen -R <host>`",
+        "needs a password": "start with --no-prompt skips them; to use them, once "
+        "per host: ssh-copy-id -i ~/.ssh/id_ed25519.pub <host>",
+        "other": "unreachable or slow",
+    }
+    lines = [f"{len(pool)} hosts in the pool:"]
+    for name, hosts in groups.items():
+        if not hosts:
+            continue
+        lines.append(f"  {name}: {len(hosts)}")
+        if name in advice:
+            lines.append(f"      ({advice[name]})")
+        lines.append("      " + " ".join(hosts))
+    return lines
+
+
 def explain_problems(problems: dict[str, str | None]) -> None:
     broken = {host: why for host, why in problems.items() if why}
     if not broken:
@@ -324,7 +368,7 @@ def main() -> None:
     parser.add_argument("base_config", type=Path)
     parser.add_argument(
         "action",
-        choices=["configs", "start", "status", "stop"],
+        choices=["hosts", "configs", "start", "status", "stop"],
         default="configs",
     )
     parser.add_argument("--n-tiles", type=int, default=1024)
@@ -332,6 +376,17 @@ def main() -> None:
     parser.add_argument("--hosts", nargs="+", help="the pool (default: from config)")
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--force", action="store_true", help="stop: kill immediately")
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="start: use only hosts that accept a passwordless login (checked in "
+        "parallel first) and never ask for a password",
+    )
+    parser.add_argument(
+        "--max-hosts",
+        type=int,
+        help="start: use at most this many hosts in total (runs plus helpers)",
+    )
     parser.add_argument(
         "--no-helpers",
         action="store_true",
@@ -350,12 +405,26 @@ def main() -> None:
     ).resolve()
 
     match args.action:
+        case "hosts":
+            print("\n".join(host_report(pool, check_hosts(pool))))
+
         case "configs":
             variants = plan_variants(base, args.strategies, args.n_tiles, pool)
             write_configs(variants, out_dir)
             print_plan(variants, out_dir)
 
         case "start":
+            if args.no_prompt:
+                problems = check_hosts(pool)
+                skipped = [h for h in pool if problems[h]]
+                pool = [h for h in pool if not problems[h]]
+                print(
+                    f"{len(pool)} of {len(skipped) + len(pool)} hosts accept a "
+                    "passwordless login; the rest are skipped "
+                    "(`hosts` action lists them)"
+                )
+                if not pool:
+                    raise SystemExit("no host accepts a passwordless login")
             variants = plan_variants(base, args.strategies, args.n_tiles, pool)
             print(f"{len(variants)} strategies, {len(pool)} hosts in the pool")
             paths: dict[str, Path] = {}
@@ -369,7 +438,7 @@ def main() -> None:
                     remote_run(variant, path),
                     [variant.host],
                     ["--steps", variant.steps],
-                    interactive=True,
+                    interactive=not args.no_prompt,
                 )[variant.host]
 
             def report(variant: Variant, outcome: str) -> None:
@@ -394,7 +463,7 @@ def main() -> None:
                         remote_run(variant, paths[variant.strategy]),
                         [host],
                         ["--steps", variant.steps],
-                        interactive=True,
+                        interactive=not args.no_prompt,
                     )[host]
 
                 helpers = add_helpers(
@@ -403,6 +472,11 @@ def main() -> None:
                     helper_starter,
                     lambda host, outcome: print(
                         f"  {host} failed ({outcome}); skipped"
+                    ),
+                    limit=(
+                        None
+                        if args.max_hosts is None
+                        else max(0, args.max_hosts - len(started))
                     ),
                 )
                 for variant in started:
