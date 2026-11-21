@@ -20,7 +20,7 @@ from stamp.preprocessing.pipeline.plan import (
     build_plan,
     encoding_possible,
     layout_for,
-    record_run_settings,
+    record_run_config,
 )
 
 _logger = logging.getLogger("stamp")
@@ -66,7 +66,7 @@ def run_pipeline_(
             f"a patient has {max_slides} slides, more than encoding.max_slides "
             f"= {limit}"
         )
-    record_run_settings(pre, cfg)
+    record_run_config(pre, cfg, steps)
     plan = build_plan(pre, cfg, patients, models or ModelLoaders.from_config(pre, cfg))
     _logger.info(
         f"pipeline: {len(patients)} patients, order {cfg.order}, "

@@ -41,7 +41,7 @@ Folders are named after the settings behind their contents, so **one
 `output_dir` holds any number of runs** (other extractors, sampling settings,
 orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
 `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`, `yottixel-8192-seed0`, `spatial-8192-seed0-cell8`,
+extractor, S = the sampling settings (`first_n-8192`, `random-8192`, `tissue-8192`, `spatial-8192-cell8`,
 `full` without sampling):
 
 | folder | contents |
@@ -58,7 +58,10 @@ extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tiss
 Both orders end in the same `features/E/G/S/` folder, because they produce the
 same training bags: if one order has run, the other finds the work done. With
 `slide_feat_dir`, T is `imported_<hash>`. Each results folder has a
-`settings.json` with the full settings it was made with.
+`config.yaml` with the configuration it was made with (tile and patient folders are shared by runs with any sampling, so they have none).
+The sampling `seed` is not in the folder name, only in `config.yaml`: running again in
+the same output folder with a different seed (or any other sampling setting that
+the name doesn't show) is rejected, so use another `output_dir` for each seed.
 
 What a second run reuses: another `n_tiles`/`strategy` redoes only sampling and
 extraction; another `extractor` redoes only extraction (the tile positions and

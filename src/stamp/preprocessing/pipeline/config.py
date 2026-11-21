@@ -120,6 +120,8 @@ class SamplingConfig(BaseModel):
     repeat: cycle through the patient's tiles again (mask=True)."""
 
     seed: int = 0
+    """Not part of the folder name; recorded in the folder's config.yaml, and a
+    run with another seed in the same folder is rejected (use another output_dir)."""
 
     background_cutoff: int = Field(default=220, gt=0, lt=256)
     """tissue only: a pixel counts as background if its grey value (0-255) is at
@@ -137,8 +139,6 @@ class SamplingConfig(BaseModel):
         if not self.enabled:
             return "full"
         parts = [self.strategy, str(self.n_tiles)]
-        if self.strategy != "first_n":
-            parts.append(f"seed{self.seed}")
         if self.strategy == "spatial":
             parts.append(f"cell{self.spatial_cell_tiles}")
         if self.strategy == "yottixel" and self.color_clusters != 9:
