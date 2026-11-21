@@ -7,6 +7,8 @@ from pathlib import Path
 
 import h5py
 
+from stamp.distributed.fs import ensure_dir
+
 
 @contextmanager
 def atomic_h5_file(path: Path) -> Iterator[h5py.File]:
@@ -16,7 +18,7 @@ def atomic_h5_file(path: Path) -> Iterator[h5py.File]:
     `path` on success and deleted on failure. Other machines therefore never see
     a half-written output, and `path.exists()` means "finished".
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with h5py.File(tmp, "w") as f:

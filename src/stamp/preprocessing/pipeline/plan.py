@@ -41,6 +41,7 @@ from typing import Any
 
 import yaml
 
+from stamp.distributed.fs import ensure_dir
 from stamp.distributed.workqueue import Step
 from stamp.encoding.encoder import Encoder
 from stamp.preprocessing.config import PreprocessingConfig
@@ -392,7 +393,7 @@ def prepare_run(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
     if path.exists():
         _check_same_run(layout.run_dir, yaml.safe_load(path.read_text()), config)
 
-    layout.run_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(layout.run_dir)
     _write_if_changed(
         path,
         "# The configuration this run was made with.\n"

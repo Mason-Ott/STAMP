@@ -1,6 +1,8 @@
 """Entry points: run the pipeline's steps, or report how far they have got."""
 
 import logging
+import random
+import time
 from collections.abc import Sequence
 
 from stamp.distributed.progress import StepProgress, step_progress
@@ -79,6 +81,9 @@ def run_pipeline_worker(
     """`stamp worker`: the pipeline as one of several workers. Returns an exit code."""
 
     def job() -> bool:
+        # Workers started together would otherwise all create the same folders and
+        # claim the same first item in the same moment.
+        time.sleep(random.uniform(0, 3))
         reports = run_pipeline_(pre, cfg, steps)
         return all(report.ok for report in reports.values())
 

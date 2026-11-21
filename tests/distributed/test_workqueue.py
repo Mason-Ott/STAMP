@@ -153,3 +153,78 @@ def test_inputs_are_deleted_only_after_the_output_is_written(tmp_path):
     retry = CoordinationConfig(**{**FAST.model_dump(), "retry_failed": True})
     run_step(step(tmp_path, ["a"], delete_inputs_when_done=True, **consuming), retry)
     assert (tmp_path / "a.out").exists() and not (tmp_path / "a.in").exists()
+
+
+def test_items_whose_inputs_exist_run_before_items_waiting_for_inputs(tmp_path):
+    order = []
+
+    def recording(item, inputs, output):
+        order.append(item)
+        writer(item, inputs, output)
+
+    ready = {"r1", "r2", "r3"}
+    for name in ready:
+        (tmp_path / f"{name}.in").write_text("")
+    # w1..w3 wait for an input that is being produced elsewhere (locked, so the
+    # run waits for it; it never appears, so they end up skipped)
+    items = ["w1", "r1", "w2", "r2", "w3", "r3"]
+    waiting_step = step(
+        tmp_path,
+        items,
+        inputs_of=lambda item: [tmp_path / f"{item}.in"],
+        run=recording,
+    )
+    run_step(waiting_step, FAST)
+    assert set(order[:3]) == ready, "everything that could run went first"
+    assert set(order) == ready, "the others have no inputs and were skipped"
+
+
+def test_ensure_dir_survives_other_machines_creating_the_same_folders(
+    tmp_path, monkeypatch
+):
+    from stamp.distributed import fs
+
+    real_mkdir = Path.mkdir
+    failures = {"left": 3}
+
+    def racing_mkdir(self, *args, **kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            real_mkdir(self, *args, **kwargs)  # the other machine got there first
+            raise FileExistsError(self)  # ...and our view of it is stale
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+    monkeypatch.setattr(fs.time, "sleep", lambda s: None)
+    target = tmp_path / "a" / "b" / "c"
+    fs.ensure_dir(target)
+    assert target.is_dir() and failures["left"] == 0
+
+
+def test_ensure_dir_gives_up_eventually(tmp_path, monkeypatch):
+    from stamp.distributed import fs
+
+    def always_fails(self, *args, **kwargs):
+        raise FileExistsError(self)
+
+    monkeypatch.setattr(Path, "mkdir", always_fails)
+    monkeypatch.setattr(fs.time, "sleep", lambda s: None)
+    with pytest.raises(FileExistsError):
+        fs.ensure_dir(tmp_path / "x", attempts=3)
+
+
+def test_many_threads_creating_the_same_folders_all_succeed(tmp_path):
+    from stamp.distributed.fs import ensure_dir
+
+    errors = []
+
+    def create(i):
+        try:
+            ensure_dir(tmp_path / "shared" / "deep" / "er" / f"{i % 3}")
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=create, args=(i,)) for i in range(24)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors

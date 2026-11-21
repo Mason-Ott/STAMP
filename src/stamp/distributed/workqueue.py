@@ -29,6 +29,7 @@ from typing import Generic, TypeVar
 from tqdm import tqdm
 
 from stamp.distributed.config import CoordinationConfig
+from stamp.distributed.fs import ensure_dir
 
 _logger = logging.getLogger("stamp")
 
@@ -104,10 +105,18 @@ def run_step(step: Step[T], coordination: CoordinationConfig) -> StepReport:
     """Produce every missing output of `step` that no other machine is working on.
 
     Items are visited in a random order per process, so machines started at the
-    same time don't all queue up behind the same item.
+    same time don't all queue up behind the same item. Items whose inputs all
+    exist come first: an item still waiting for an input that another machine is
+    producing is left for last instead of blocking the ones that can run now.
     """
-    items = list(step.items)
-    random.Random(f"{socket.gethostname()}-{os.getpid()}").shuffle(items)
+    rng = random.Random(f"{socket.gethostname()}-{os.getpid()}")
+    ready, waiting = [], []
+    for item in step.items:
+        inputs = step.inputs_of(item)
+        (ready if all(path.exists() for path in inputs) else waiting).append(item)
+    rng.shuffle(ready)
+    rng.shuffle(waiting)
+    items = ready + waiting
 
     report = StepReport()
     progress = tqdm(items, desc=step.name)
@@ -255,7 +264,7 @@ def claim(output: Path, stale_after_s: float) -> Iterator[bool]:
 
 def _create_lock(lock: Path, stale_after_s: float) -> bool:
     """Atomically create `lock`, taking over a stale one. False if someone holds it."""
-    lock.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(lock.parent)
     age = _lock_age_s(lock)
     if age is not None and age > stale_after_s:
         _logger.warning(f"taking over stale lock {lock}")

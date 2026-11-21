@@ -196,3 +196,75 @@ def test_the_sweep_needs_an_experiment_name():
     pipeline = {k: v for k, v in BASE["pipeline"].items() if k != "experiment"}
     with pytest.raises(ValueError, match="pipeline.experiment"):
         sweep.plan_variants({**BASE, "pipeline": pipeline}, ["entropy"], 1024)
+
+
+def test_sweep_workers_check_for_each_other_often():
+    for variant in sweep.plan_variants(BASE, ["entropy"], 1024):
+        assert variant.config["pipeline"]["coordination"]["poll_interval_s"] == 5.0
+    slow = {
+        **BASE,
+        "pipeline": {**BASE["pipeline"], "coordination": {"poll_interval_s": 60}},
+    }
+    variant = sweep.plan_variants(slow, ["entropy"], 1024)[0]
+    assert variant.config["pipeline"]["coordination"]["poll_interval_s"] == 60, (
+        "an explicit setting is kept"
+    )
+
+
+def test_spare_hosts_help_the_most_expensive_runs_in_turn():
+    variants = sweep.plan_variants(
+        BASE, ["first_n", "conch_kmeans", "texture"], 1024, ["h1", "h2", "h3"]
+    )
+    started = []
+
+    def starter(variant, host):
+        started.append((variant.strategy, host))
+        return "started"
+
+    helpers = sweep.add_helpers(variants, ["s1", "s2", "s3", "s4", "s5"], starter)
+    # heaviest first: conch_kmeans, texture, first_n, then around again
+    assert started == [
+        ("conch_kmeans", "s1"),
+        ("texture", "s2"),
+        ("first_n", "s3"),
+        ("conch_kmeans", "s4"),
+        ("texture", "s5"),
+    ]
+    assert helpers == {
+        "conch_kmeans": ["s1", "s4"],
+        "texture": ["s2", "s5"],
+        "first_n": ["s3"],
+    }
+
+
+def test_a_failing_spare_is_skipped_and_the_turn_is_not_lost():
+    variants = sweep.plan_variants(
+        BASE, ["conch_kmeans", "texture"], 1024, ["h1", "h2"]
+    )
+    reported = []
+    helpers = sweep.add_helpers(
+        variants,
+        ["bad", "ok1", "ok2"],
+        lambda variant, host: "failed: down" if host == "bad" else "started",
+        lambda host, outcome: reported.append(host),
+    )
+    assert reported == ["bad"]
+    assert helpers == {"conch_kmeans": ["ok1"], "texture": ["ok2"]}
+
+
+def test_no_spares_or_no_runs_means_no_helpers():
+    variants = sweep.plan_variants(BASE, ["entropy"], 1024, ["h1"])
+    assert sweep.add_helpers(variants, [], lambda v, h: "started") == {"entropy": []}
+    assert sweep.add_helpers([], ["s1"], lambda v, h: "started") == {}
+
+
+def test_helpers_are_recorded_in_the_config_for_status_and_stop(tmp_path):
+    variant = sweep.plan_variants(BASE, ["texture"], 1024, ["h1"])[0]
+    helped = sweep.with_helpers(variant, ["s1", "s2"])
+    assert helped.hosts == ["h1", "s1", "s2"]
+    sweep.write_configs([helped], tmp_path)
+    loaded = sweep.load_variants(tmp_path, ["texture"])[0]
+    assert (loaded.host, loaded.helpers) == ("h1", ("s1", "s2"))
+    assert loaded.config["pipeline"]["workers"]["hosts"] == ["h1", "s1", "s2"]
+    # moving the run to another host drops the old helpers
+    assert sweep.with_host(helped, "h9").hosts == ["h9"]
