@@ -6,16 +6,21 @@ from collections.abc import Sequence
 from stamp.distributed.progress import StepProgress, step_progress
 from stamp.distributed.worker import run_as_worker
 from stamp.distributed.workqueue import StepReport, run_step
-from stamp.preprocessing.config import PreprocessingConfig
+from stamp.preprocessing.config import ExtractorName, PreprocessingConfig
 from stamp.preprocessing.data.clinical import load_patients
-from stamp.preprocessing.pipeline.config import PipelineConfig, StepName, check_steps
+from stamp.preprocessing.pipeline.config import (
+    ENCODING_STEPS,
+    PipelineConfig,
+    StepName,
+    check_steps,
+)
 from stamp.preprocessing.pipeline.plan import (
     ModelLoaders,
     active_steps,
     build_plan,
     encoding_possible,
     layout_for,
-    record_run_settings,
+    record_run_config,
 )
 
 _logger = logging.getLogger("stamp")
@@ -36,7 +41,7 @@ def run_pipeline_(
     steps = list(steps) if steps is not None else active_steps(pre, cfg)
     check_steps(cfg, steps)
     if not encoding_possible(pre, cfg):
-        if StepName.ENCODE in steps:
+        if any(s in ENCODING_STEPS for s in steps):
             raise ValueError(
                 f"encoder {cfg.encoder} can't use features from {pre.extractor}"
             )
@@ -44,9 +49,24 @@ def run_pipeline_(
             f"pipeline: skipping encoding: {cfg.encoder} can't use features "
             f"from {pre.extractor}"
         )
-    record_run_settings(pre, cfg)
-
+    if (
+        cfg.sampling.enabled
+        and cfg.sampling.strategy == "conch_kmeans"
+        and pre.extractor != ExtractorName.CONCH1_5
+    ):
+        raise ValueError(
+            "sampling strategy 'conch_kmeans' clusters conch1_5 features, not "
+            f"{pre.extractor} features; set preprocessing.extractor: conch1_5"
+        )
     patients = load_patients(cfg.clinical_table, cfg.columns, pre.wsi_dir)
+    max_slides = max((len(p.slides) for p in patients), default=0)
+    _logger.info(f"pipeline: at most {max_slides} slides per patient")
+    if (limit := cfg.encoding.max_slides) is not None and max_slides > limit:
+        raise ValueError(
+            f"a patient has {max_slides} slides, more than encoding.max_slides "
+            f"= {limit}"
+        )
+    record_run_config(pre, cfg, steps)
     plan = build_plan(pre, cfg, patients, models or ModelLoaders.from_config(pre, cfg))
     _logger.info(
         f"pipeline: {len(patients)} patients, order {cfg.order}, "

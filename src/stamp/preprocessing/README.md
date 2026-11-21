@@ -41,7 +41,7 @@ Folders are named after the settings behind their contents, so **one
 `output_dir` holds any number of runs** (other extractors, sampling settings,
 orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
 `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`,
+extractor, S = the sampling settings (`first_n-8192`, `random-8192`, `tissue-8192`, `spatial-8192-cell8`,
 `full` without sampling):
 
 | folder | contents |
@@ -58,7 +58,10 @@ extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tiss
 Both orders end in the same `features/E/G/S/` folder, because they produce the
 same training bags: if one order has run, the other finds the work done. With
 `slide_feat_dir`, T is `imported_<hash>`. Each results folder has a
-`settings.json` with the full settings it was made with.
+`config.yaml` with the configuration it was made with (tile and patient folders are shared by runs with any sampling, so they have none).
+The sampling `seed` is not in the folder name, only in `config.yaml`: running again in
+the same output folder with a different seed (or any other sampling setting that
+the name doesn't show) is rejected, so use another `output_dir` for each seed.
 
 What a second run reuses: another `n_tiles`/`strategy` redoes only sampling and
 extraction; another `extractor` redoes only extraction (the tile positions and
@@ -85,6 +88,33 @@ on, it is applied first and the sampled bag is chunked. Chunked embeddings go in
 their own folder (`.../chunk8192-seed0/`) and record `n_chunks`. The tiles of a
 chunk are a random subset spread over the whole patient, so TITAN sees them at
 their usual positions with gaps between them.
+
+**One embedding per slide, then combine them.** To encode each slide on its
+own (e.g. four TITAN embeddings for a patient with four WSIs) and combine them:
+
+```yaml
+pipeline:
+  encoder: titan
+  encoding:
+    slide_aggregation: mean      # mean | max | concat
+    # max_slides: 6              # concat only: slots per patient, zero-padded
+```
+
+- `mean`: the average of the slide embeddings, `max`: the element-wise maximum
+  (both 768 numbers for TITAN), `concat`: the slide embeddings one after the
+  other in slide-id order, zero-padded to `max_slides` slides (`6 * 768`
+  numbers). `max_slides` must be at least the largest number of slides of any
+  patient; the run logs that number and refuses to start if it is too small.
+  Which slot a slide gets carries no meaning across patients, so concatenation
+  suits small, fixed slide counts best.
+- The per-slide embeddings are written once to `slide_embeddings/...`
+  (`slide_feats`: one row per slide, plus `slide_ids`); the `aggregate` step then
+  writes the patient embeddings to `embeddings/.../slides_<method>/`. Trying
+  another method reruns only `aggregate`: change `slide_aggregation` and run
+  again, nothing is re-encoded.
+- A slide's tiles use the slide's own coordinates. With `chunk_size`, chunking
+  happens within each slide (chunk embeddings averaged), so sampling off plus
+  chunks gives every tile of every slide.
 
 **Encoding needs a compatible extractor.** An `encoder` only accepts features
 from certain extractors (TITAN: `conch1_5`). With any other extractor the run
@@ -123,7 +153,27 @@ tiles are kept, ties broken at random (`seed`). It reads the tile images from
 the tile cache, which costs about one pass over the cached tiles of every slide
 that has more tiles than its quota. Slides that fit entirely aren't scored.
 
-To add a strategy, see `steps/sample.py`.
+More strategies (all keep each slide's quota of tiles, in raster order; `seed`
+makes them reproducible):
+
+| strategy | how it picks tiles | needs |
+|---|---|---|
+| `spatial` | divides the tissue into a grid (`spatial_cell_tiles`, default 8 tiles per side) and samples from each cell in proportion to its tile count | positions |
+| `entropy` | the tiles with the highest grey-level (Shannon) entropy | tile images |
+| `texture` | k-means on GLCM texture statistics (contrast, dissimilarity, homogeneity, energy, correlation); keeps the tile nearest each of `quota` cluster centres | tile images |
+| `yottixel` | Yottixel's mosaic: RGB-histogram k-means (`color_clusters`, default 9), the quota shared among the colour clusters by size, then spatial k-means inside each; keeps the tile nearest each spatial centre | tile images |
+| `conch_kmeans` | k-means on the (L2-normalised) tile features into `quota` clusters; keeps the tile nearest each centre | `conch1_5` features |
+
+**Where each strategy can run.** The config is rejected at load time otherwise:
+position-only strategies (`first_n`, `random`, `spatial`) work anywhere; image
+strategies (`tissue`, `entropy`, `texture`, `yottixel`) read the tile cache, so
+they work in both orders but not with `slide_feat_dir` (imported features have no
+tile cache); `conch_kmeans` needs features before sampling, so only
+`order: extract_then_sample`, and the extractor must be `conch1_5`.
+`conch_kmeans` uses mini-batch k-means (full k-means with thousands of clusters on
+768-d embeddings is too slow), and cost grows with the quota.
+
+To add a strategy, see `steps/sample.py` and `steps/sampling_methods.py`.
 
 ## Running on several machines
 

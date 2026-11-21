@@ -51,7 +51,7 @@ def test_slide_feat_dir_needs_extract_then_sample():
     [
         ({}, "first_n-8192"),
         ({"enabled": False}, "full"),
-        ({"strategy": "random", "seed": 3}, "random-8192-seed3"),
+        ({"strategy": "random", "seed": 3}, "random-8192"),
         ({"pad_mode": "zero", "redistribute": False}, "first_n-8192-noredist-pad_zero"),
     ],
 )
