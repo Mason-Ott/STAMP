@@ -364,10 +364,7 @@ def main() -> None:
                 path = paths[variant.strategy] = write_configs([variant], out_dir)[
                     variant.strategy
                 ]
-                print(
-                    f"{variant.strategy}: trying {variant.host} "
-                    "(password if asked, Enter to skip this host)"
-                )
+                print(f"{variant.strategy}: trying {variant.host}")
                 return start(
                     remote_run(variant, path),
                     [variant.host],
@@ -453,10 +450,13 @@ def main() -> None:
                     ),
                     reachable,
                 )
-            result_of = dict(zip(reachable, outcomes, strict=True))
+            result_of = {
+                (variant.strategy, host): outcome
+                for (variant, host), outcome in zip(reachable, outcomes, strict=True)
+            }
             print()
             for variant, host in pairs:
-                outcome = result_of.get((variant, host), "unreachable")
+                outcome = result_of.get((variant.strategy, host), "unreachable")
                 role = "" if host == variant.host else " (helper)"
                 print(f"{variant.strategy:<13} {host:<12} {outcome}{role}")
             if args.action == "status" and not args.no_progress:

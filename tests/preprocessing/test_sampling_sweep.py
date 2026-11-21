@@ -268,3 +268,80 @@ def test_helpers_are_recorded_in_the_config_for_status_and_stop(tmp_path):
     assert loaded.config["pipeline"]["workers"]["hosts"] == ["h1", "s1", "s2"]
     # moving the run to another host drops the old helpers
     assert sweep.with_host(helped, "h9").hosts == ["h9"]
+
+
+def run_main(monkeypatch, capsys, *argv):
+    monkeypatch.setattr("sys.argv", ["sampling_sweep.py", *argv])
+    sweep.main()
+    return capsys.readouterr().out
+
+
+def test_status_and_stop_run_end_to_end_with_helpers(tmp_path, monkeypatch, capsys):
+    from stamp.distributed.remote import HostState
+
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+    variants = sweep.plan_variants(BASE, ["entropy", "texture"], 1024, ["h1", "h2"])
+    sweep.write_configs([sweep.with_helpers(variants[0], ["s1"]), variants[1]], out_dir)
+
+    stopped = []
+    monkeypatch.setattr(sweep, "check_hosts", lambda hosts: dict.fromkeys(hosts))
+    monkeypatch.setattr(
+        sweep, "host_states", lambda run, hosts: {hosts[0]: HostState.RUNNING}
+    )
+    monkeypatch.setattr(
+        sweep,
+        "stop",
+        lambda run, hosts, force: stopped.append(hosts[0]) or {hosts[0]: "stopping"},
+    )
+    common = [
+        str(base),
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--out-dir", str(out_dir),
+    ]  # fmt: skip
+
+    status = run_main(
+        monkeypatch, capsys, common[0], "status", *common[1:], "--no-progress"
+    )
+    assert "entropy       h1           worker running" in status
+    assert "entropy       s1           worker running (helper)" in status
+    assert "texture       h2           worker running" in status
+
+    run_main(monkeypatch, capsys, common[0], "stop", *common[1:])
+    assert sorted(stopped) == ["h1", "h2", "s1"], "helpers are stopped too"
+
+
+def test_start_runs_end_to_end_and_records_the_helpers(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+
+    started = []
+
+    def fake_start(run, hosts, worker_args=(), *, interactive=False):
+        host = hosts[0]
+        started.append((run.config_file.stem, host))
+        return {host: "failed: no route" if host == "bad" else "started"}
+
+    monkeypatch.setattr(sweep, "start", fake_start)
+    out = run_main(
+        monkeypatch,
+        capsys,
+        str(base),
+        "start",
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--hosts", "bad", "h1", "h2", "h3", "h4",
+        "--out-dir", str(out_dir),
+    )  # fmt: skip
+    assert "bad failed" in out and "entropy" in out
+    # entropy skipped `bad`; texture got h2; h3 and h4 help the heaviest run first
+    assert ("sampling_entropy", "h1") in started
+    assert ("sampling_texture", "h2") in started
+    loaded = {
+        v.strategy: v for v in sweep.load_variants(out_dir, ["entropy", "texture"])
+    }
+    assert loaded["texture"].hosts == ["h2", "h3"]
+    assert loaded["entropy"].hosts == ["h1", "h4"]
