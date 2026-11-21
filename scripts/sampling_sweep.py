@@ -1,6 +1,5 @@
 """Compare sampling strategies: one config per strategy, each run on its own host.
 
-    python scripts/sampling_sweep.py configs/crc_pipeline.yaml ssh-setup
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml start --n-tiles 1024
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml status --n-tiles 1024
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml stop --n-tiles 1024
@@ -8,26 +7,27 @@
 Run it from the STAMP folder, with the environment active.
 
 Actions
-  ssh-setup  for every host in the pool that does not accept your key yet, run
-             `ssh-copy-id` (asks for your password once per host), then re-check.
-  configs    only write the configs and show the plan (no ssh).
-  start      check the hosts, write the configs and start one worker per strategy.
+  start      give every strategy a host and start its worker there.
   status     worker state and progress of every strategy.
   stop       stop the workers (--force kills them).
+  configs    only write the configs and show the plan (no ssh).
 
-`pipeline.workers.hosts` is a **pool**. `start` checks every host in parallel,
-skips the ones that do not accept a passwordless login (and says why), and gives
-the strategies, in order, to the working hosts. If starting on a host fails
-anyway, the strategy moves to the next unused host of the pool. Only if the pool
-has fewer working hosts than strategies does a host run two at once. Put more
-hosts in the pool than strategies to have spares.
+`pipeline.workers.hosts` is a **pool**. `start` goes through the strategies in
+order and, for each, tries the pool's hosts in order (skipping hosts already
+given a strategy) until one starts it: it just runs `ssh host ...`. A host that
+accepts your key needs nothing. A host that asks for a password asks you on the
+terminal: type it, or press Enter to skip that host. If a host fails for any
+reason (no such host, wrong password, unreachable) the next one is tried. Put more
+hosts in the pool than strategies to have spares. If the pool runs out, the
+strategies still without a host are listed with the command to start them.
 
-Each config is a copy of the base config with the strategy and `n_tiles` set, no
-encoder, visualisations on, and `workers.hosts` set to its one host. They are
-written to `--out-dir` (default `configs/sweeps/sampling_<n_tiles>`, which must be
-on storage every host sees) and started with `stamp workers start`, so logs and
-progress work as for any run (`<output_dir>/logs/<host>.log`). `status` and `stop`
-use the hosts recorded in those files.
+The connection stays open for a few hours, so `status` and `stop` do not ask for
+the password again. Each strategy gets its own config: a copy of the base config
+with the strategy and `n_tiles` set, no encoder, visualisations on, and
+`workers.hosts` set to its host. They are written to `--out-dir` (default
+`configs/sweeps/sampling_<n_tiles>`, which must be on storage every host sees) and
+started with `stamp workers start`, so logs and progress work as for any run
+(`<output_dir>/logs/<host>.log`). `status` and `stop` use the hosts recorded there.
 
 All strategies share the base config's `output_dir`: tiling and combining are done
 once between them (the hosts split the slides), and each strategy then writes its
@@ -138,28 +138,29 @@ def load_variants(out_dir: Path, strategies: list[str]) -> list[Variant]:
     return variants
 
 
-def working_hosts(pool: list[str], problems: dict[str, str | None]) -> list[str]:
-    """The pool's hosts that passed the check, in pool order."""
-    return [host for host in pool if not problems.get(host)]
-
-
-def start_all(
+def allocate(
     variants: list[Variant],
-    spares: list[str],
+    pool: list[str],
     starter: Callable[[Variant], str],
+    report: Callable[[Variant, str], None] = lambda variant, outcome: None,
 ) -> list[tuple[Variant, str]]:
-    """Start every variant on its host (in parallel). One that fails moves to the
-    next spare host, until it starts or there are no spares left. Returns each
-    variant (with the host it ended up on) and the last outcome."""
-    results = parallel(lambda v: (v, starter(v)), variants)
-    spares = list(spares)
-    final = []
-    for variant, outcome in results:
-        while is_failure(outcome) and spares:
-            variant = with_host(variant, spares.pop(0))
-            outcome = starter(variant)
-        final.append((variant, outcome))
-    return final
+    """Give each variant, in order, the first unused host of the pool that starts
+    it (`starter` returns an outcome; one starting with "failed" moves on to the
+    next host). A host is never given to two variants. Returns each variant, with
+    the host it ended up on, and its last outcome; a variant left without a host
+    has host "" and a failed outcome. `report` is called for every failed try."""
+    free = list(pool)
+    results = []
+    for variant in variants:
+        placed, outcome = with_host(variant, ""), "failed: no host left in the pool"
+        while free:
+            placed = with_host(variant, free.pop(0))
+            outcome = starter(placed)
+            if not is_failure(outcome):
+                break
+            report(placed, outcome)
+        results.append((placed, outcome))
+    return results
 
 
 def is_failure(outcome: str) -> bool:
@@ -198,37 +199,6 @@ def check_ssh(host: str) -> str | None:
 
 def check_hosts(hosts: list[str]) -> dict[str, str | None]:
     return dict(zip(hosts, parallel(check_ssh, hosts), strict=True))
-
-
-def setup_ssh(pool: list[str], key: Path) -> None:
-    """ssh-copy-id to every host that does not accept the key yet, one after
-    another because each asks for your password."""
-    if not key.exists():
-        raise SystemExit(
-            f"{key} does not exist; create one with: ssh-keygen -t ed25519"
-        )
-    problems = check_hosts(pool)
-    for host in pool:
-        why = problems[host]
-        if why is None:
-            print(f"{host}: already works")
-        elif "resolve" in why.lower():
-            print(f"{host}: {why} (not a host name here; remove it from the pool)")
-        else:
-            print(f"\n{host}: {why}\ninstalling {key.name}; enter your password:")
-            subprocess.run(
-                [
-                    "ssh-copy-id",
-                    "-i",
-                    str(key),
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    host,
-                ]
-            )
-    print("\nafter setup:")
-    for host, why in check_hosts(pool).items():
-        print(f"  {host}: {'ok' if why is None else why}")
 
 
 def parallel[T, R](function: Callable[[T], R], items: list[T]) -> list[R]:
@@ -270,10 +240,10 @@ def explain_problems(problems: dict[str, str | None]) -> None:
     broken = {host: why for host, why in problems.items() if why}
     if not broken:
         return
-    print("\nhosts skipped (no passwordless ssh login):")
+    print("\nhosts not reachable without a password prompt:")
     for host, why in broken.items():
         print(f"  {host}: {why}")
-    print("  fix 'Permission denied' for all of them with the `ssh-setup` action")
+    print("  (hosts started through `start` stay connected for a few hours)")
 
 
 def main() -> None:
@@ -283,14 +253,13 @@ def main() -> None:
     parser.add_argument("base_config", type=Path)
     parser.add_argument(
         "action",
-        choices=["ssh-setup", "configs", "start", "status", "stop"],
+        choices=["configs", "start", "status", "stop"],
         default="configs",
     )
     parser.add_argument("--n-tiles", type=int, default=1024)
     parser.add_argument("--strategies", nargs="+", default=list(STEPS), choices=STEPS)
     parser.add_argument("--hosts", nargs="+", help="the pool (default: from config)")
     parser.add_argument("--out-dir", type=Path)
-    parser.add_argument("--key", type=Path, default=Path("~/.ssh/id_ed25519.pub"))
     parser.add_argument("--force", action="store_true", help="stop: kill immediately")
     parser.add_argument("--no-progress", action="store_true", help="skip progress")
     args = parser.parse_args()
@@ -304,46 +273,52 @@ def main() -> None:
     ).resolve()
 
     match args.action:
-        case "ssh-setup":
-            setup_ssh(pool, args.key.expanduser())
-
         case "configs":
             variants = plan_variants(base, args.strategies, args.n_tiles, pool)
             write_configs(variants, out_dir)
             print_plan(variants, out_dir)
 
         case "start":
-            problems = check_hosts(pool)
-            usable = working_hosts(pool, problems)
-            explain_problems(problems)
-            if not usable:
-                raise SystemExit(
-                    "\nno host accepts a passwordless login: nothing started"
-                )
-            variants = plan_variants(base, args.strategies, args.n_tiles, usable)
-            spares = usable[len(variants) :]
-            if len(usable) < len(variants):
-                print(
-                    f"\nonly {len(usable)} working hosts for {len(variants)} "
-                    "strategies: some hosts will run two at once"
-                )
-            paths = write_configs(variants, out_dir)
+            variants = plan_variants(base, args.strategies, args.n_tiles, pool)
+            print(f"{len(variants)} strategies, {len(pool)} hosts in the pool")
+            paths: dict[str, Path] = {}
 
             def starter(variant: Variant) -> str:
-                path = write_configs([variant], out_dir)[variant.strategy]
+                path = paths[variant.strategy] = write_configs([variant], out_dir)[
+                    variant.strategy
+                ]
+                print(
+                    f"{variant.strategy}: trying {variant.host} "
+                    "(password if asked, Enter to skip this host)"
+                )
                 return start(
                     remote_run(variant, path),
                     [variant.host],
                     ["--steps", variant.steps],
+                    interactive=True,
                 )[variant.host]
 
-            results = start_all(variants, spares, starter)
+            def report(variant: Variant, outcome: str) -> None:
+                print(f"  {variant.host} failed ({outcome}); trying the next host")
+
+            results = allocate(variants, pool, starter, report)
             print()
             for variant, outcome in results:
-                print(f"{variant.strategy:<13} {variant.host:<12} {outcome}")
-            first = remote_run(results[0][0], paths[results[0][0].strategy])
-            print(f"\nlogs: {first.log_file('<host>')}")
-            if any(is_failure(outcome) for _, outcome in results):
+                print(f"{variant.strategy:<13} {variant.host or '-':<12} {outcome}")
+
+            left = [v.strategy for v, outcome in results if is_failure(outcome)]
+            started = [v for v, outcome in results if not is_failure(outcome)]
+            if started:
+                first = remote_run(started[0], paths[started[0].strategy])
+                print(f"\nlogs: {first.log_file('<host>')}")
+            if left:
+                print(
+                    f"\nno host left for: {', '.join(left)}.\nAdd hosts to "
+                    "pipeline.workers.hosts, then start the rest on hosts not used "
+                    "above:\n  python scripts/sampling_sweep.py "
+                    f"{args.base_config} start --n-tiles {args.n_tiles} "
+                    f"--strategies {' '.join(left)} --hosts <new hosts>"
+                )
                 raise SystemExit(1)
 
         case "status" | "stop":

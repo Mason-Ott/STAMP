@@ -86,51 +86,80 @@ def test_configs_are_written_one_file_per_strategy(tmp_path):
     assert written["pipeline"]["sampling"]["strategy"] == "entropy"
 
 
-def test_working_hosts_keeps_pool_order_and_drops_failures():
-    problems = {"h1": None, "h2": "Permission denied", "h3": None, "h4": "timed out"}
-    assert sweep.working_hosts(["h1", "h2", "h3", "h4", "h5"], problems) == [
-        "h1",
-        "h3",
-        "h5",
+def allocate(strategies, pool, outcomes):
+    """Run `allocate` with a fake starter; `outcomes` maps host -> outcome."""
+    variants = sweep.plan_variants(BASE, strategies, 1024, pool)
+    tried, reported = [], []
+
+    def starter(variant):
+        tried.append((variant.strategy, variant.host))
+        return outcomes.get(variant.host, "started")
+
+    results = sweep.allocate(
+        variants, pool, starter, lambda v, o: reported.append((v.host, o))
+    )
+    return [(v.strategy, v.host, o) for v, o in results], tried, reported
+
+
+def test_each_strategy_takes_the_next_host_of_the_pool():
+    results, tried, _ = allocate(["entropy", "random"], ["h1", "h2", "h3"], {})
+    assert results == [("entropy", "h1", "started"), ("random", "h2", "started")]
+    assert tried == [("entropy", "h1"), ("random", "h2")], "h3 stays a spare"
+
+
+def test_a_failing_host_is_skipped_and_the_next_one_tried():
+    outcomes = {"h1": "failed: Permission denied", "h2": "failed: No route to host"}
+    results, tried, reported = allocate(
+        ["entropy", "random"], ["h1", "h2", "h3", "h4"], outcomes
+    )
+    assert results == [("entropy", "h3", "started"), ("random", "h4", "started")]
+    assert tried == [
+        ("entropy", "h1"),
+        ("entropy", "h2"),
+        ("entropy", "h3"),
+        ("random", "h4"),
+    ]
+    assert reported == [
+        ("h1", "failed: Permission denied"),
+        ("h2", "failed: No route to host"),
     ]
 
 
-def test_a_strategy_whose_host_fails_moves_to_the_next_spare_host():
-    variants = sweep.plan_variants(BASE, ["entropy", "random"], 1024, ["h1", "h2"])
-    started = []
-
-    def starter(variant):
-        started.append((variant.strategy, variant.host))
-        return "failed: ssh: boom" if variant.host == "h1" else "started"
-
-    results = sweep.start_all(variants, spares=["h3", "h4"], starter=starter)
-    by_strategy = {v.strategy: (v.host, outcome) for v, outcome in results}
-    assert by_strategy == {"entropy": ("h3", "started"), "random": ("h2", "started")}
-    assert ("entropy", "h1") in started, "tried the first host before moving on"
-    moved = next(v for v, _ in results if v.strategy == "entropy")
-    assert moved.config["pipeline"]["workers"]["hosts"] == ["h3"]
+def test_a_host_is_never_given_two_strategies():
+    results, _, _ = allocate(
+        ["entropy", "random", "tissue"], ["h1", "h2"], {"h1": "already running"}
+    )
+    hosts = [
+        host
+        for _, host, outcome in results
+        if outcome in ("started", "already running")
+    ]
+    assert len(hosts) == len(set(hosts)) == 2
+    assert results[2] == ("tissue", "", "failed: no host left in the pool")
 
 
-def test_without_spares_a_failure_is_reported():
+def test_a_pool_that_runs_out_leaves_the_rest_without_a_host():
+    results, tried, _ = allocate(
+        ["entropy", "random"], ["h1", "h2"], {"h1": "failed: x", "h2": "failed: y"}
+    )
+    assert results[0][1:] == ("h2", "failed: y")
+    assert results[1] == ("random", "", "failed: no host left in the pool")
+    assert [h for _, h in tried] == ["h1", "h2"]
+
+
+def test_the_moved_strategy_has_its_new_host_in_the_config():
     variants = sweep.plan_variants(BASE, ["entropy"], 1024, ["h1"])
-    results = sweep.start_all(variants, spares=[], starter=lambda v: "failed: down")
-    assert [(v.host, o) for v, o in results] == [("h1", "failed: down")]
-
-
-def test_several_failures_use_spares_in_order_and_stop_when_they_run_out():
-    variants = sweep.plan_variants(
-        BASE, ["entropy", "random", "tissue"], 1024, ["a", "b", "c"]
-    )
-    bad = {"a", "b", "c", "d"}
-    results = sweep.start_all(
+    seen = []
+    results = sweep.allocate(
         variants,
-        spares=["d", "e"],
-        starter=lambda v: "failed: x" if v.host in bad else "started",
+        ["h1", "h2"],
+        lambda v: (
+            seen.append(v.config["pipeline"]["workers"]["hosts"])
+            or ("failed" if v.host == "h1" else "started")
+        ),
     )
-    outcomes = {v.strategy: (v.host, o) for v, o in results}
-    assert outcomes["entropy"] == ("e", "started")
-    assert outcomes["random"][1].startswith("failed"), "no spares left"
-    assert outcomes["tissue"][1].startswith("failed")
+    assert seen == [["h1"], ["h2"]]
+    assert results[0][0].config["pipeline"]["workers"]["hosts"] == ["h2"]
 
 
 def test_status_and_stop_use_the_hosts_written_by_start(tmp_path):
