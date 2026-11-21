@@ -60,13 +60,15 @@ def run_as_worker(job: Callable[[], bool], workers: WorkersConfig | None) -> int
 
 @contextmanager
 def _interrupt_on_stop_signals() -> Iterator[None]:
-    """Make SIGINT and SIGTERM raise KeyboardInterrupt, however the process was started.
+    """Make SIGINT, SIGTERM and SIGHUP raise KeyboardInterrupt, however the process
+    was started.
 
     Needed because a process started in the background by a non-interactive
     shell inherits SIGINT as *ignored*, in which case Python never raises
     KeyboardInterrupt and the presence check's interrupt does nothing.
     """
-    stop_signals = (signal.SIGINT, signal.SIGTERM)
+    # SIGHUP is what ending the screen session (`stamp workers stop --force`) sends
+    stop_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     previous = {
         sig: signal.signal(sig, _raise_keyboard_interrupt) for sig in stop_signals
     }

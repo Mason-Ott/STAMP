@@ -12,6 +12,7 @@ import numpy.typing as npt
 import openslide
 from PIL import Image, ImageDraw
 
+from stamp.distributed.fs import ensure_dir
 from stamp.preprocessing.data.bags import SlideInfo
 
 USED_STYLE = {"fill": (0, 170, 0, 70), "outline": (0, 140, 0, 220)}
@@ -69,7 +70,7 @@ def save_tile_overview(
     draw.rectangle((0, 0, 7 * len(caption) + 12, 22), fill=(255, 255, 255, 200))
     draw.text((6, 5), caption, fill=(0, 0, 0, 255))
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(output.parent)
     Image.alpha_composite(thumbnail, overlay).convert("RGB").save(output)
 
 
@@ -98,7 +99,7 @@ def save_patient_overview(
     image = draw_patient_overview(
         panels, tile_size_um=tile_size_um, title=title, max_dimension=max_dimension
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(output.parent)
     image.save(output)
 
 

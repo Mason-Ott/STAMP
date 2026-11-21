@@ -79,7 +79,13 @@ def _run_cli(args: argparse.Namespace) -> None:
             if config.preprocessing is None:
                 raise ValueError("no preprocessing configuration supplied")
 
-            _add_file_handle_(_logger, output_dir=config.preprocessing.output_dir)
+            if config.pipeline is not None:
+                from stamp.preprocessing.pipeline.plan import layout_for
+
+                log_dir = layout_for(config.preprocessing, config.pipeline).run_dir
+            else:
+                log_dir = config.preprocessing.output_dir
+            _add_file_handle_(_logger, output_dir=log_dir)
             _logger.info(
                 "using the following configuration:\n"
                 f"{yaml.dump(config.preprocessing.model_dump(mode='json', exclude_none=True))}"

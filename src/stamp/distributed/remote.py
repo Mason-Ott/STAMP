@@ -27,10 +27,25 @@ _logger = logging.getLogger("stamp")
 
 T = TypeVar("T")
 
+CONTROL_PATH = "/tmp/stamp-ssh-%C"
+"""Where ssh keeps connection sockets (local disk: sockets don't work on network
+storage). A connection opened interactively stays up for a while, and later calls
+reuse it without authenticating again."""
+
 SSH_OPTIONS = (
     "-o", "BatchMode=yes",  # fail instead of prompting for a password
     "-o", "ConnectTimeout=10",
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", f"ControlPath={CONTROL_PATH}",  # reuse an open connection if there is one
+)  # fmt: skip
+
+INTERACTIVE_SSH_OPTIONS = (
+    "-o", "ConnectTimeout=10",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "NumberOfPasswordPrompts=1",  # a wrong or empty password fails the host
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={CONTROL_PATH}",
+    "-o", "ControlPersist=4h",  # type the password once; status/stop reuse it
 )  # fmt: skip
 
 SSH_UNREACHABLE = 255
@@ -75,15 +90,23 @@ class RemoteRun:
 
 
 def start(
-    run: RemoteRun, hosts: Sequence[str], worker_args: Sequence[str] = ()
+    run: RemoteRun,
+    hosts: Sequence[str],
+    worker_args: Sequence[str] = (),
+    *,
+    interactive: bool = False,
 ) -> dict[str, str]:
     """Start a worker on each host that doesn't have one yet. Host -> outcome.
 
     `worker_args` are added to the `stamp worker` command line (e.g. --steps).
+    With `interactive`, ssh may ask for a password on the terminal (so use one
+    host at a time); otherwise a host needing one fails.
     """
 
     def start_on(host: str) -> str:
-        result = _ssh(host, _start_command(run, host, worker_args))
+        result = _ssh(
+            host, _start_command(run, host, worker_args), interactive=interactive
+        )
         if result.returncode == 0:
             return result.stdout.strip() or "started"
         return f"failed: {_error(result)}"
@@ -94,8 +117,10 @@ def start(
 def stop(run: RemoteRun, hosts: Sequence[str], *, force: bool) -> dict[str, str]:
     """Ask each host's worker to stop (SIGTERM), or kill its session if `force`.
 
-    A normal stop lets the worker release its locks. A forced stop doesn't, so
-    its unfinished item waits until the lock goes stale.
+    A normal stop signals the worker itself; a forced stop ends the whole screen
+    session (the worker gets a hangup, handled like a stop, but its DataLoader
+    children and anything slow to unwind are cut off). If the worker doesn't get to
+    release its lock, its unfinished item waits until the lock goes stale.
     """
     if force:
         command = f"screen -S {run.session} -X quit"
@@ -152,13 +177,17 @@ def _session_exists(run: RemoteRun) -> str:
     return f"screen -ls 2>/dev/null | grep -qE '[0-9]+\\.{run.session}[[:space:]]'"
 
 
-def _ssh(host: str, command: str, timeout_s: float = 60) -> subprocess.CompletedProcess:
+def _ssh(
+    host: str, command: str, timeout_s: float = 60, *, interactive: bool = False
+) -> subprocess.CompletedProcess:
+    options = INTERACTIVE_SSH_OPTIONS if interactive else SSH_OPTIONS
     try:
         return subprocess.run(
-            ["ssh", *SSH_OPTIONS, host, command],
-            capture_output=True,
+            ["ssh", *options, host, command],
+            capture_output=True,  # a password prompt still goes to the terminal
             text=True,
-            timeout=timeout_s,
+            # typing a password takes a while
+            timeout=None if interactive else timeout_s,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess([], SSH_UNREACHABLE, "", "timed out")

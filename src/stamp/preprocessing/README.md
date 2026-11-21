@@ -25,6 +25,8 @@ preprocessing:            # unchanged: tiling + extractor settings
   device: cuda
 
 pipeline:
+  experiment: sampling_comparison       # the question; results go in <output_dir>/<experiment>/
+  run: entropy                          # optional: this run's folder name
   clinical_table: /data/clinical.csv   # patient_id, slide_id, label, hospital
   order: sample_then_extract
   sampling: {n_tiles: 8192, strategy: first_n, pad_mode: none}
@@ -35,36 +37,58 @@ pipeline:
 `hospital_patientid`, the same `group_key` the split pipeline uses. All
 settings are documented in `pipeline/config.py` and `distributed/config.py`.
 
-## Outputs (under `preprocessing.output_dir`)
+## Outputs: experiments and runs
 
-Folders are named after the settings behind their contents, so **one
-`output_dir` holds any number of runs** (other extractors, sampling settings,
-orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
-`256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`,
-`full` without sampling):
+Results are organised as `<output_dir>/<experiment>/<run>/`. An **experiment** is
+a question (e.g. "which sampling method?"); a **run** is one answer to try (one
+sampling method, one model). A single run is just an experiment with one run.
 
-| folder | contents |
-|---|---|
-| `tile_positions/T/` | tile positions, one file per slide |
-| `patient_positions/G/` | all tile positions of a patient |
-| `sampled_positions/G/S/` | the sampled tile positions |
-| `slide_features/E/T/` | `extract_then_sample`: per-slide features |
-| `patient_features/E/G/` | `extract_then_sample`: patient features, all tiles |
-| **`features/E/G/S/`** | **training bags**: one per patient, sampled tiles with features |
-| `embeddings/<encoder>/E/G/S/` | one embedding per patient (only with `encoder`) |
-| `overviews/tiles/T/`, `overviews/sampled/G/S/` | thumbnails, if `save_visualisations` |
+```
+<output_dir>/
+`-- sampling_comparison/              the experiment
+    |-- README.md                     index of its runs
+    |-- shared/                       work every run reuses (done once)
+    |   |-- tile_positions/T/            tile positions, one file per slide
+    |   |-- patient_positions/G/         all tile positions of a patient
+    |   |-- slide_features/E/T/          extract_then_sample: per-slide features
+    |   |-- patient_features/E/G/        extract_then_sample: patient features
+    |   `-- overviews/tiles/T/           tile thumbnails
+    |-- entropy/                      one run
+    |   |-- config.yaml                  what the run was made with
+    |   |-- README.md                    steps in order, and where everything is
+    |   |-- sampled_positions/           sample_then_extract: the sampled tiles
+    |   |-- sampled_features/            extract_then_sample: the sampled tiles
+    |   |-- features/                    training bags: one per patient
+    |   |-- embeddings/<encoder>/        one embedding per patient (with an encoder)
+    |   |-- overviews/                   sampling thumbnails (save_visualisations)
+    |   `-- logs/                        worker logs
+    `-- random/ ...
+```
+T = tiling settings (e.g. `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine
+settings), E = the extractor. The shared folders are keyed by the settings that
+shape them, so runs of one experiment can differ in tile size or extractor and
+still share what they can. `pipeline.run` names the run folder; without it the
+name is derived (`<extractor>-<sampling>`, e.g. `conch1_5-first_n-8192`).
+`pipeline.experiment` is required, so runs can't land in the wrong experiment by
+accident.
 
-Both orders end in the same `features/E/G/S/` folder, because they produce the
-same training bags: if one order has run, the other finds the work done. With
-`slide_feat_dir`, T is `imported_<hash>`. Each results folder has a
-`settings.json` with the full settings it was made with.
+Each run's **README.md** is generated from its config: it draws the steps in
+order with the settings each uses and where its output goes, and shows the run's
+folder tree. `config.yaml` is the run's configuration (without hosts, locking and
+`--steps`). Run it again with `stamp -c <run>/config.yaml preprocess`; finished
+work is skipped.
 
-What a second run reuses: another `n_tiles`/`strategy` redoes only sampling and
-extraction; another `extractor` redoes only extraction (the tile positions and
-the STAMP tile cache are shared); adding an `encoder` redoes only encoding;
-changing tile size or cutoffs starts from the slides (the tile cache is keyed
-the same way).
+**A run folder is for one set of results.** If it already holds a `config.yaml`
+with different result-shaping settings (sampling incl. the seed, tile settings,
+extractor, order, gap), the run is rejected before anything is written: give it
+another `run` name. Adding an `encoder` to an existing run is fine (embeddings go
+in `embeddings/<encoder>/`).
+
+What another run of the same experiment reuses: everything in `shared/` whose
+settings match. Another `n_tiles`/`strategy` redoes only sampling and extraction;
+another `extractor` redoes extraction (tile positions and the STAMP tile cache are
+shared); changing tile size or cutoffs starts from the slides (the tile cache is
+keyed the same way). Another *experiment* shares nothing but the tile cache.
 
 **Using every tile.** TITAN's memory grows quickly with the number of tiles, so
 by default the bag is capped by sampling. To use all of a patient's tiles, turn
@@ -86,13 +110,40 @@ their own folder (`.../chunk8192-seed0/`) and record `n_chunks`. The tiles of a
 chunk are a random subset spread over the whole patient, so TITAN sees them at
 their usual positions with gaps between them.
 
+**One embedding per slide, then combine them.** To encode each slide on its
+own (e.g. four TITAN embeddings for a patient with four WSIs) and combine them:
+
+```yaml
+pipeline:
+  encoder: titan
+  encoding:
+    slide_aggregation: mean      # mean | max | concat
+    # max_slides: 6              # concat only: slots per patient, zero-padded
+```
+
+- `mean`: the average of the slide embeddings, `max`: the element-wise maximum
+  (both 768 numbers for TITAN), `concat`: the slide embeddings one after the
+  other in slide-id order, zero-padded to `max_slides` slides (`6 * 768`
+  numbers). `max_slides` must be at least the largest number of slides of any
+  patient; the run logs that number and refuses to start if it is too small.
+  Which slot a slide gets carries no meaning across patients, so concatenation
+  suits small, fixed slide counts best.
+- The per-slide embeddings are written once to `slide_embeddings/...`
+  (`slide_feats`: one row per slide, plus `slide_ids`); the `aggregate` step then
+  writes the patient embeddings to `embeddings/.../slides_<method>/`. Trying
+  another method reruns only `aggregate`: change `slide_aggregation` and run
+  again, nothing is re-encoded.
+- A slide's tiles use the slide's own coordinates. With `chunk_size`, chunking
+  happens within each slide (chunk embeddings averaged), so sampling off plus
+  chunks gives every tile of every slide.
+
 **Encoding needs a compatible extractor.** An `encoder` only accepts features
 from certain extractors (TITAN: `conch1_5`). With any other extractor the run
 logs a warning and skips the `encode` step; asking for `--steps encode`
 explicitly is an error.
 
 **Intermediate files are kept** (`keep_intermediates: true`, the default), which
-is what makes that reuse possible. Set it to `false` to save disk: a stage's
+is what makes the sharing possible. Set it to `false` to save disk: a stage's
 file is then deleted once the next stage has written its own, so only the latest
 finished stage remains (plus training bags, embeddings and overviews), and a run
 with other settings starts again from the slides. Rerunning the same
@@ -123,7 +174,27 @@ tiles are kept, ties broken at random (`seed`). It reads the tile images from
 the tile cache, which costs about one pass over the cached tiles of every slide
 that has more tiles than its quota. Slides that fit entirely aren't scored.
 
-To add a strategy, see `steps/sample.py`.
+More strategies (all keep each slide's quota of tiles, in raster order; `seed`
+makes them reproducible):
+
+| strategy | how it picks tiles | needs |
+|---|---|---|
+| `spatial` | divides the tissue into a grid (`spatial_cell_tiles`, default 8 tiles per side) and samples from each cell in proportion to its tile count | positions |
+| `entropy` | the tiles with the highest grey-level (Shannon) entropy | tile images |
+| `texture` | k-means on GLCM texture statistics (contrast, dissimilarity, homogeneity, energy, correlation); keeps the tile nearest each of `quota` cluster centres | tile images |
+| `yottixel` | Yottixel's mosaic: RGB-histogram k-means (`color_clusters`, default 9), the quota shared among the colour clusters by size, then spatial k-means inside each; keeps the tile nearest each spatial centre | tile images |
+| `conch_kmeans` | k-means on the (L2-normalised) tile features into `quota` clusters; keeps the tile nearest each centre | `conch1_5` features |
+
+**Where each strategy can run.** The config is rejected at load time otherwise:
+position-only strategies (`first_n`, `random`, `spatial`) work anywhere; image
+strategies (`tissue`, `entropy`, `texture`, `yottixel`) read the tile cache, so
+they work in both orders but not with `slide_feat_dir` (imported features have no
+tile cache); `conch_kmeans` needs features before sampling, so only
+`order: extract_then_sample`, and the extractor must be `conch1_5`.
+`conch_kmeans` uses mini-batch k-means (full k-means with thousands of clusters on
+768-d embeddings is too slow), and cost grows with the quota.
+
+To add a strategy, see `steps/sample.py` and `steps/sampling_methods.py`.
 
 ## Running on several machines
 

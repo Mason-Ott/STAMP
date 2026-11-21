@@ -1,16 +1,18 @@
 preprocessing:
-  output_dir: "/csse/research/cancerimages/CRC_Dataset/patient_pipeline"
-  wsi_dir: "/csse/research/cancerimages/CRC_Dataset/wsis"
+  output_dir: "/path/to/output"
+  wsi_dir: "/path/to/wsis"
   extractor: "conch1_5"
   device: "cuda"
-  cache_dir: "/csse/research/cancerimages/CRC_Dataset/wsis/conch_cache"
+  cache_dir: "/path/to/tile_cache"
   tile_size_px: 224          # tile_size_um stays at the default (256)
   max_workers: 8
   save_visualisations: true
   visualisation_max_dimension: 4000
 
 pipeline:
-  clinical_table: "/csse/research/cancerimages/CRC_Dataset/dataset_5_patients.csv"   # Patient, StudyID/SlideID, isLNM, hospital
+  experiment: "my_experiment"     # results go in <output_dir>/<experiment>/<run>/
+  # run: "first_n"                # this run's folder; default derived from the settings
+  clinical_table: "/path/to/clinical_table.csv"   # Patient, StudyID/SlideID, isLNM, hospital
   order: "extract_then_sample"
 
   sampling:
@@ -21,6 +23,6 @@ pipeline:
   encoder: "titan"
 
   workers:
-    hosts: ["cs250053kx", "cs250054kx"]      # your lab machines
-    project_dir: "/csse/users/mot30/Masters/STAMP"
-    activate: "source /csse/users/mot30/Masters/STAMP/.venv/bin/activate"
+    hosts: ["host1", "host2"]      # machines with passwordless ssh and shared storage
+    project_dir: "/path/to/STAMP"
+    activate: "source /path/to/STAMP/.venv/bin/activate"

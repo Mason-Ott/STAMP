@@ -4,7 +4,9 @@ from stamp.preprocessing.pipeline.config import PipelineConfig, StepName, check_
 
 
 def config(**settings) -> PipelineConfig:
-    return PipelineConfig.model_validate({"clinical_table": "c.csv", **settings})
+    return PipelineConfig.model_validate(
+        {"experiment": "e", "clinical_table": "c.csv", **settings}
+    )
 
 
 @pytest.mark.parametrize(
@@ -51,7 +53,7 @@ def test_slide_feat_dir_needs_extract_then_sample():
     [
         ({}, "first_n-8192"),
         ({"enabled": False}, "full"),
-        ({"strategy": "random", "seed": 3}, "random-8192-seed3"),
+        ({"strategy": "random", "seed": 3}, "random-8192"),
         ({"pad_mode": "zero", "redistribute": False}, "first_n-8192-noredist-pad_zero"),
     ],
 )
