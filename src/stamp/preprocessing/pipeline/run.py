@@ -15,7 +15,7 @@ from stamp.preprocessing.pipeline.plan import (
     build_plan,
     encoding_possible,
     layout_for,
-    record_run_settings,
+    record_run_config,
 )
 
 _logger = logging.getLogger("stamp")
@@ -53,7 +53,7 @@ def run_pipeline_(
             "sampling strategy 'conch_kmeans' clusters conch1_5 features, not "
             f"{pre.extractor} features; set preprocessing.extractor: conch1_5"
         )
-    record_run_settings(pre, cfg)
+    record_run_config(pre, cfg, steps)
 
     patients = load_patients(cfg.clinical_table, cfg.columns, pre.wsi_dir)
     plan = build_plan(pre, cfg, patients, models or ModelLoaders.from_config(pre, cfg))

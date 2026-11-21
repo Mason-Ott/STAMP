@@ -1,6 +1,5 @@
 """End-to-end runs on synthetic slides, with a fake extractor and encoder."""
 
-import json
 import sys
 import types
 from pathlib import Path
@@ -259,7 +258,7 @@ def test_sampling_overviews_show_the_sampled_tiles(make_configs, fake_models):
     ], "per-slide tile overviews"
 
     overviews = layout.sampling_overviews
-    assert sorted(p.name for p in overviews.iterdir()) == [
+    assert sorted(p.name for p in overviews.glob("*.png")) == [
         "H1_P1.png",
         "H1_P2.png",
         "H2_P1.png",
@@ -467,15 +466,63 @@ def test_runs_with_other_settings_share_one_output_dir(make_configs, fake_models
     assert layout_for(other_pre, cfg).training_bags != first
 
 
-def test_settings_are_recorded_next_to_the_results(make_configs, fake_models):
+def test_the_configuration_is_recorded_next_to_the_results(make_configs, fake_models):
+    import yaml
+
     pre, cfg = run(
         make_configs, fake_models, "recorded", encoder="titan", extractor="conch1_5"
     )
     layout = layout_for(pre, cfg)
-    for folder in (layout.training_bags, layout.embeddings):
-        recorded = json.loads((folder / "settings.json").read_text())
-        assert recorded["sampling"]["n_tiles"] == cfg.sampling.n_tiles
-        assert recorded["encoder"] == "titan"
+    sampled = layout.stage(StepName.SAMPLE).folder
+    for folder in (sampled, layout.training_bags, layout.embeddings):
+        recorded = yaml.safe_load((folder / "config.yaml").read_text())
+        assert recorded["pipeline"]["sampling"]["n_tiles"] == cfg.sampling.n_tiles
+        assert recorded["pipeline"]["sampling"]["seed"] == 0
+        assert recorded["pipeline"]["encoder"] == "titan"
+        assert recorded["preprocessing"]["extractor"] == "conch1_5"
+        assert "workers" not in recorded["pipeline"]
+    # tiling and patient folders are shared by runs with any sampling
+    for step in (StepName.TILE, StepName.COMBINE):
+        assert not (layout.stage(step).folder / "config.yaml").exists()
+
+
+def test_sampling_only_runs_record_their_configuration_too(make_configs, fake_models):
+    pre, cfg = make_configs("sampling_only", sampling={"n_tiles": 20})
+    pre = pre.model_copy(update={"save_visualisations": True})
+    steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE]
+    run_pipeline_(pre, cfg, steps, models=fake_models)
+    layout = layout_for(pre, cfg)
+    assert (layout.stage(StepName.SAMPLE).folder / "config.yaml").exists()
+    assert (layout.sampling_overviews / "config.yaml").exists()
+    assert not layout.training_bags.exists()
+
+
+def test_the_seed_is_recorded_but_not_in_the_folder_name(make_configs, fake_models):
+    import yaml
+
+    seeded = {"strategy": "random", "n_tiles": 20, "seed": 5}
+    pre, cfg = make_configs("seeded", sampling=seeded)
+    assert "seed" not in layout_for(pre, cfg).training_bags.name
+    steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE]
+    run_pipeline_(pre, cfg, steps, models=fake_models)
+    folder = layout_for(pre, cfg).stage(StepName.SAMPLE).folder
+    assert (
+        yaml.safe_load((folder / "config.yaml").read_text())["pipeline"]["sampling"][
+            "seed"
+        ]
+        == 5
+    )
+
+    # The same folder with another seed would mix up two different samples.
+    other = cfg.model_copy(
+        update={"sampling": cfg.sampling.model_copy(update={"seed": 6})}
+    )
+    assert layout_for(pre, other).stage(StepName.SAMPLE).folder == folder
+    with pytest.raises(ValueError, match="different sampling settings.*seed: 5 -> 6"):
+        run_pipeline_(pre, other, steps, models=fake_models)
+    # ...and rerunning with the same seed is fine.
+    reports = run_pipeline_(pre, cfg, steps, models=fake_models)
+    assert all(r.ok and r.done == 0 for r in reports.values())
 
 
 def test_failed_stage_keeps_its_input_for_recovery(

@@ -101,13 +101,13 @@ def test_conch_kmeans_needs_the_conch1_5_extractor(make_configs, fake_models):
 
 def test_tags_name_the_strategy_and_its_settings():
     tag = lambda **kw: SamplingConfig(n_tiles=50, **kw).tag  # noqa: E731
-    assert tag(strategy="spatial") == "spatial-50-seed0-cell8"
-    assert tag(strategy="spatial", spatial_cell_tiles=4) == "spatial-50-seed0-cell4"
-    assert tag(strategy="yottixel") == "yottixel-50-seed0"
-    assert tag(strategy="yottixel", color_clusters=5) == "yottixel-50-seed0-colors5"
-    assert tag(strategy="entropy", seed=2) == "entropy-50-seed2"
-    assert tag(strategy="texture") == "texture-50-seed0"
-    assert tag(strategy="conch_kmeans") == "conch_kmeans-50-seed0"
+    assert tag(strategy="spatial") == "spatial-50-cell8"
+    assert tag(strategy="spatial", spatial_cell_tiles=4) == "spatial-50-cell4"
+    assert tag(strategy="yottixel") == "yottixel-50"
+    assert tag(strategy="yottixel", color_clusters=5) == "yottixel-50-colors5"
+    assert tag(strategy="entropy", seed=2) == "entropy-50"
+    assert tag(strategy="texture") == "texture-50"
+    assert tag(strategy="conch_kmeans") == "conch_kmeans-50"
 
 
 # --- pure pieces -------------------------------------------------------------

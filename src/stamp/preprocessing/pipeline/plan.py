@@ -28,13 +28,14 @@ sampling settings.
 """
 
 import hashlib
-import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from stamp.distributed.workqueue import Step
 from stamp.encoding.encoder import Encoder
@@ -62,8 +63,8 @@ SLIDE_STEPS = frozenset(
 )
 """Steps that write one file per slide; the others write one file per patient."""
 
-SETTINGS_FILE = "settings.json"
-"""Written into each kept stage folder: the settings it was made with."""
+CONFIG_FILE = "config.yaml"
+"""Written into the result folders of a run: the configuration it ran with."""
 
 
 @dataclass(frozen=True)
@@ -345,36 +346,73 @@ def _import_settings(
     )
 
 
-def run_settings(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, Any]:
-    """The settings that shape the results, as written to `settings.json`."""
+def run_config(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, object]:
+    """The configuration a run used, as written to `config.yaml`. Leaves out what
+    doesn't change the results (hosts, locking, which steps were asked for)."""
     return {
-        "order": str(cfg.order),
-        "extractor": str(pre.extractor),
-        "tile_size_um": float(pre.tile_size_um),
-        "tile_size_px": int(pre.tile_size_px),
-        "brightness_cutoff": pre.brightness_cutoff,
-        "canny_cutoff": pre.canny_cutoff,
-        "drop_edge_tiles": cfg.drop_edge_tiles,
-        "virtual_gap_tiles": cfg.virtual_gap_tiles,
-        "sampling": cfg.sampling.model_dump(mode="json"),
-        "slide_feat_dir": None
-        if cfg.slide_feat_dir is None
-        else str(cfg.slide_feat_dir),
-        "encoder": None if cfg.encoder is None else str(cfg.encoder),
+        "preprocessing": pre.model_dump(mode="json"),
+        "pipeline": cfg.model_dump(
+            mode="json", exclude={"workers", "coordination", "steps"}
+        ),
     }
 
 
-def record_run_settings(pre: PreprocessingConfig, cfg: PipelineConfig) -> None:
-    """Write `settings.json` into the folders holding the run's results, so a
-    folder says what made it. The folder names already keep runs apart."""
-    text = json.dumps(run_settings(pre, cfg), indent=2) + "\n"
-    for stage in layout_for(pre, cfg).stages:
-        if not stage.kept:
-            continue
-        path = stage.folder / SETTINGS_FILE
-        if path.exists() and path.read_text() == text:
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
+def record_run_config(
+    pre: PreprocessingConfig, cfg: PipelineConfig, steps: Sequence[StepName]
+) -> None:
+    """Write `config.yaml` into the result folders of the steps about to run.
+
+    A folder is named after the settings that shape its contents, except the
+    sampling seed. So if a folder already holds results made with different
+    sampling settings (another seed), stop: they would be mixed up with, or
+    mistaken for, the new ones.
+    """
+    layout = layout_for(pre, cfg)
+    folders = [
+        stage.folder
+        for stage in layout.stages
+        if stage.step in steps and stage.step in _SETTINGS_DEPENDENT_STEPS
+    ]
+    if StepName.SAMPLE in steps and pre.save_visualisations:
+        folders.append(layout.sampling_overviews)
+
+    config = run_config(pre, cfg)
+    text = (
+        "# The configuration this folder's contents were made with.\n"
+        + yaml.safe_dump(config, sort_keys=False)
+    )
+    for folder in folders:
+        path = folder / CONFIG_FILE
+        if path.exists():
+            recorded = yaml.safe_load(path.read_text())
+            _check_same_sampling(folder, recorded, config)
+            if path.read_text() == text:
+                continue
+        folder.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_text(text)
         tmp.replace(path)
+
+
+_SETTINGS_DEPENDENT_STEPS = (StepName.SAMPLE, StepName.EXTRACT, StepName.ENCODE)
+"""Steps whose result folder depends on the sampling settings (the tiling and
+patient folders are shared by runs with any sampling)."""
+
+
+def _check_same_sampling(
+    folder: Path, recorded: dict[str, Any], current: dict[str, object]
+) -> None:
+    old = recorded["pipeline"]["sampling"]
+    new = current["pipeline"]["sampling"]  # type: ignore[index]
+    if old == new:
+        return
+    changed = "; ".join(
+        f"{key}: {old.get(key)!r} -> {new.get(key)!r}"
+        for key in sorted(set(old) | set(new))
+        if old.get(key) != new.get(key)
+    )
+    raise ValueError(
+        f"{folder} holds results made with different sampling settings "
+        f"({changed}). The folder name doesn't include everything that can differ "
+        "(e.g. the seed), so use a different preprocessing.output_dir for this run."
+    )
