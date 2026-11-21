@@ -24,6 +24,13 @@ from stamp.preprocessing.data.clinical import Patient
 from stamp.preprocessing.pipeline.config import SamplingConfig, SamplingStrategy
 from stamp.preprocessing.slides.overview import save_patient_overview
 from stamp.preprocessing.slides.tile_cache import TileReader
+from stamp.preprocessing.steps.sampling_methods import (
+    entropy,
+    feature_kmeans,
+    spatial_grid,
+    texture,
+    yottixel,
+)
 
 _logger = logging.getLogger("stamp")
 
@@ -89,6 +96,11 @@ SAMPLERS: dict[SamplingStrategy, Sampler] = {
     "first_n": first_n,
     "random": uniform_random,
     "tissue": least_background,
+    "spatial": spatial_grid,
+    "entropy": entropy,
+    "texture": texture,
+    "yottixel": yottixel,
+    "conch_kmeans": feature_kmeans,
 }
 
 
