@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from stamp.distributed.progress import StepProgress, step_progress
 from stamp.distributed.worker import run_as_worker
 from stamp.distributed.workqueue import StepReport, run_step
-from stamp.preprocessing.config import PreprocessingConfig
+from stamp.preprocessing.config import ExtractorName, PreprocessingConfig
 from stamp.preprocessing.data.clinical import load_patients
 from stamp.preprocessing.pipeline.config import PipelineConfig, StepName, check_steps
 from stamp.preprocessing.pipeline.plan import (
@@ -43,6 +43,15 @@ def run_pipeline_(
         _logger.warning(
             f"pipeline: skipping encoding: {cfg.encoder} can't use features "
             f"from {pre.extractor}"
+        )
+    if (
+        cfg.sampling.enabled
+        and cfg.sampling.strategy == "conch_kmeans"
+        and pre.extractor != ExtractorName.CONCH1_5
+    ):
+        raise ValueError(
+            "sampling strategy 'conch_kmeans' clusters conch1_5 features, not "
+            f"{pre.extractor} features; set preprocessing.extractor: conch1_5"
         )
     record_run_settings(pre, cfg)
 

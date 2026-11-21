@@ -41,7 +41,7 @@ Folders are named after the settings behind their contents, so **one
 `output_dir` holds any number of runs** (other extractors, sampling settings,
 orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
 `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`,
+extractor, S = the sampling settings (`first_n-8192`, `random-8192-seed0`, `tissue-8192-seed0`, `yottixel-8192-seed0`, `spatial-8192-seed0-cell8`,
 `full` without sampling):
 
 | folder | contents |
@@ -103,7 +103,27 @@ tiles are kept, ties broken at random (`seed`). It reads the tile images from
 the tile cache, which costs about one pass over the cached tiles of every slide
 that has more tiles than its quota. Slides that fit entirely aren't scored.
 
-To add a strategy, see `steps/sample.py`.
+More strategies (all keep each slide's quota of tiles, in raster order; `seed`
+makes them reproducible):
+
+| strategy | how it picks tiles | needs |
+|---|---|---|
+| `spatial` | divides the tissue into a grid (`spatial_cell_tiles`, default 8 tiles per side) and samples from each cell in proportion to its tile count | positions |
+| `entropy` | the tiles with the highest grey-level (Shannon) entropy | tile images |
+| `texture` | k-means on GLCM texture statistics (contrast, dissimilarity, homogeneity, energy, correlation); keeps the tile nearest each of `quota` cluster centres | tile images |
+| `yottixel` | Yottixel's mosaic: RGB-histogram k-means (`color_clusters`, default 9), the quota shared among the colour clusters by size, then spatial k-means inside each; keeps the tile nearest each spatial centre | tile images |
+| `conch_kmeans` | k-means on the (L2-normalised) tile features into `quota` clusters; keeps the tile nearest each centre | `conch1_5` features |
+
+**Where each strategy can run.** The config is rejected at load time otherwise:
+position-only strategies (`first_n`, `random`, `spatial`) work anywhere; image
+strategies (`tissue`, `entropy`, `texture`, `yottixel`) read the tile cache, so
+they work in both orders but not with `slide_feat_dir` (imported features have no
+tile cache); `conch_kmeans` needs features before sampling, so only
+`order: extract_then_sample`, and the extractor must be `conch1_5`.
+`conch_kmeans` uses mini-batch k-means (full k-means with thousands of clusters on
+768-d embeddings is too slow), and cost grows with the quota.
+
+To add a strategy, see `steps/sample.py` and `steps/sampling_methods.py`.
 
 ## Running on several machines
 

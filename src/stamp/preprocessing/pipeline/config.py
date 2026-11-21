@@ -47,7 +47,30 @@ class StepName(StrEnum):
     """patient features -> one embedding per patient (e.g. TITAN)"""
 
 
-SamplingStrategy = Literal["first_n", "random", "tissue"]
+SamplingStrategy = Literal[
+    "first_n",
+    "random",
+    "tissue",
+    "spatial",
+    "entropy",
+    "texture",
+    "yottixel",
+    "conch_kmeans",
+]
+
+STRATEGY_INPUT: dict[SamplingStrategy, Literal["positions", "images", "features"]] = {
+    "first_n": "positions",
+    "random": "positions",
+    "spatial": "positions",
+    "tissue": "images",
+    "entropy": "images",
+    "texture": "images",
+    "yottixel": "images",
+    "conch_kmeans": "features",
+}
+"""What each strategy looks at, which decides where it can run (see
+`check_sampling`): positions work anywhere; images need the tile cache (so not
+with imported features); features exist only in extract_then_sample."""
 PadMode = Literal["none", "zero", "repeat"]
 
 
@@ -62,7 +85,17 @@ class SamplingConfig(BaseModel):
     random: uniformly random tiles within each slide (uses `seed`).
     tissue: the tiles with the least background within each slide (see
     `background_cutoff`); ties are broken randomly (uses `seed`). Reads the
-    tile images from the tile cache, so it needs the tile step."""
+    tile images from the tile cache, so it needs the tile step.
+    spatial: divide the tissue into a grid (`spatial_cell_tiles`) and sample from
+    each cell in proportion to its tile count (uses `seed`).
+    entropy: the tiles with the highest grey-level (Shannon) entropy.
+    texture: k-means on GLCM texture statistics, keeping the tile nearest each
+    cluster centre (uses `seed`).
+    yottixel: RGB-histogram k-means (`color_clusters`), then spatial k-means
+    within each colour cluster (uses `seed`).
+    conch_kmeans: k-means on the tile features, keeping the tile nearest each
+    centre (uses `seed`). Needs conch1_5 features, so only extract_then_sample.
+    The quota is the number of clusters for texture and conch_kmeans."""
 
     n_tiles: int = Field(default=8192, gt=0)
     """Bag size per patient. Each slide gets n_tiles // n_slides tiles."""
@@ -82,14 +115,24 @@ class SamplingConfig(BaseModel):
     """tissue only: a pixel counts as background if its grey value (0-255) is at
     least this. A tile's score is its fraction of non-background pixels."""
 
+    spatial_cell_tiles: int = Field(default=8, gt=0)
+    """spatial only: side of a grid cell, in tiles."""
+
+    color_clusters: int = Field(default=9, gt=0)
+    """yottixel only: number of RGB-histogram clusters (Yottixel uses 9)."""
+
     @property
     def tag(self) -> str:
         """Folder name for bags produced with these settings, e.g. first_n-8192."""
         if not self.enabled:
             return "full"
         parts = [self.strategy, str(self.n_tiles)]
-        if self.strategy in ("random", "tissue"):
+        if self.strategy != "first_n":
             parts.append(f"seed{self.seed}")
+        if self.strategy == "spatial":
+            parts.append(f"cell{self.spatial_cell_tiles}")
+        if self.strategy == "yottixel" and self.color_clusters != 9:
+            parts.append(f"colors{self.color_clusters}")
         if self.strategy == "tissue" and self.background_cutoff != 220:
             parts.append(f"bg{self.background_cutoff}")
         if not self.redistribute:
@@ -179,6 +222,7 @@ class PipelineConfig(BaseModel):
             raise ValueError(
                 "slide_feat_dir only applies to order: extract_then_sample"
             )
+        check_sampling(self)
         if self.steps is not None:
             check_steps(self, self.steps)
         return self
@@ -215,4 +259,24 @@ def check_steps(cfg: PipelineConfig, steps: Sequence[StepName]) -> None:
             f"steps {bad} don't apply to order {cfg.order}"
             f"{' with slide_feat_dir' if cfg.slide_feat_dir else ''}; "
             f"valid steps: {[str(s) for s in cfg.default_steps()]}"
+        )
+
+
+def check_sampling(cfg: PipelineConfig) -> None:
+    """Reject a sampling strategy that can't work where this configuration
+    samples: before anything runs, with what to change."""
+    if not cfg.sampling.enabled:
+        return
+    strategy = cfg.sampling.strategy
+    needs = STRATEGY_INPUT[strategy]
+    if needs == "features" and cfg.order != Order.EXTRACT_THEN_SAMPLE:
+        raise ValueError(
+            f"sampling strategy '{strategy}' uses the tile features, which only "
+            f"exist before sampling in order: extract_then_sample (not {cfg.order})"
+        )
+    if needs == "images" and cfg.slide_feat_dir is not None:
+        raise ValueError(
+            f"sampling strategy '{strategy}' uses the tile images, but "
+            "slide_feat_dir imports features without a tile cache; use a "
+            "strategy that only needs positions (first_n, random, spatial)"
         )
