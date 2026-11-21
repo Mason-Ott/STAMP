@@ -23,6 +23,7 @@ BASE = {
         "save_visualisations": False,
     },
     "pipeline": {
+        "experiment": "sweep",
         "clinical_table": "/clinical.csv",
         "order": "extract_then_sample",
         "sampling": {"n_tiles": 8192, "strategy": "first_n", "pad_mode": "repeat"},
@@ -173,3 +174,25 @@ def test_status_and_stop_use_the_hosts_written_by_start(tmp_path):
     ]
     with pytest.raises(SystemExit, match="run `start` first"):
         sweep.load_variants(tmp_path, ["tissue"])
+
+
+def test_a_sweep_is_one_experiment_with_a_run_per_strategy(tmp_path):
+    variants = sweep.plan_variants(BASE, ["entropy", "random"], 1024)
+    for variant in variants:
+        pipeline = variant.config["pipeline"]
+        assert pipeline["experiment"] == "sweep"
+        assert pipeline["run"] == variant.strategy
+        run = sweep.remote_run(variant, tmp_path / f"{variant.strategy}.yaml")
+        # logs and the worker's session name come from the run's own folder
+        assert run.output_dir == Path("/out/sweep") / variant.strategy
+        assert run.log_file("h1") == run.output_dir / "logs" / "h1.log"
+    sessions = {
+        sweep.remote_run(v, tmp_path / f"{v.strategy}.yaml").session for v in variants
+    }
+    assert len(sessions) == 2
+
+
+def test_the_sweep_needs_an_experiment_name():
+    pipeline = {k: v for k, v in BASE["pipeline"].items() if k != "experiment"}
+    with pytest.raises(ValueError, match="pipeline.experiment"):
+        sweep.plan_variants({**BASE, "pipeline": pipeline}, ["entropy"], 1024)

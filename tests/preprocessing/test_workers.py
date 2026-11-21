@@ -98,6 +98,7 @@ def remote_run(dataset, tmp_path) -> RemoteRun:
                     "max_workers": 2,
                 },
                 "pipeline": {
+                    "experiment": "e",
                     "clinical_table": str(dataset.clinical_table),
                     "sampling": {"n_tiles": 50},
                     "coordination": {"poll_interval_s": 0.2},

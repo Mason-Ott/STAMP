@@ -25,13 +25,14 @@ The connection stays open for a few hours, so `status` and `stop` do not ask for
 the password again. Each strategy gets its own config: a copy of the base config
 with the strategy and `n_tiles` set, no encoder, visualisations on, and
 `workers.hosts` set to its host. They are written to `--out-dir` (default
-`configs/sweeps/sampling_<n_tiles>`, which must be on storage every host sees) and
+`configs/sweeps/<experiment>`, which must be on storage every host sees) and
 started with `stamp workers start`, so logs and progress work as for any run
 (`<output_dir>/logs/<host>.log`). `status` and `stop` use the hosts recorded there.
 
-All strategies share the base config's `output_dir`: tiling and combining are done
-once between them (the hosts split the slides), and each strategy then writes its
-own folder, e.g. `overviews/sampled/<patient folder>/<strategy>-<n_tiles>/`.
+The sweep is one experiment (`pipeline.experiment` in the base config) with one run
+per strategy: `<output_dir>/<experiment>/<strategy>/` holds that run's config.yaml,
+README.md, sampled tiles, thumbnails and logs. Tiling and combining are done once
+for all runs, in `<output_dir>/<experiment>/shared/` (the hosts split the slides).
 """
 
 import argparse
@@ -80,6 +81,8 @@ def plan_variants(
     workers = base.get("pipeline", {}).get("workers")
     if not workers or not (hosts or workers.get("hosts")):
         raise ValueError("the config needs pipeline.workers.hosts (or pass --hosts)")
+    if not base["pipeline"].get("experiment"):
+        raise ValueError("the config needs pipeline.experiment (the sweep's name)")
     hosts = hosts or workers["hosts"]
 
     variants = []
@@ -94,6 +97,7 @@ def plan_variants(
             if strategy == "conch_kmeans"
             else "sample_then_extract"
         )
+        pipeline["run"] = strategy
         pipeline["sampling"] = {
             **pipeline.get("sampling", {}),
             "strategy": strategy,
@@ -174,7 +178,12 @@ def remote_run(variant: Variant, config_file: Path) -> RemoteRun:
     workers = variant.config["pipeline"]["workers"]
     return RemoteRun(
         config_file=config_file,
-        output_dir=Path(variant.config["preprocessing"]["output_dir"]).resolve(),
+        # the run's own folder: its logs and the worker's session name come from it
+        output_dir=(
+            Path(variant.config["preprocessing"]["output_dir"])
+            / variant.config["pipeline"]["experiment"]
+            / variant.config["pipeline"]["run"]
+        ).resolve(),
         workers=WorkersConfig(**workers),
         project_dir=workers.get("project_dir") or str(Path.cwd()),
     )
@@ -269,7 +278,8 @@ def main() -> None:
     if not pool:
         raise SystemExit("the config needs pipeline.workers.hosts (or pass --hosts)")
     out_dir = (
-        args.out_dir or Path("configs/sweeps") / f"sampling_{args.n_tiles}"
+        args.out_dir
+        or Path("configs/sweeps") / base.get("pipeline", {}).get("experiment", "sweep")
     ).resolve()
 
     match args.action:

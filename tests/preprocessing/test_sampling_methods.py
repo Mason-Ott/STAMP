@@ -28,7 +28,9 @@ from .test_pipeline import read_folder
 
 
 def config(**kwargs) -> PipelineConfig:
-    return PipelineConfig.model_validate({"clinical_table": "unused.csv", **kwargs})
+    return PipelineConfig.model_validate(
+        {"experiment": "e", "clinical_table": "unused.csv", **kwargs}
+    )
 
 
 @pytest.mark.parametrize(

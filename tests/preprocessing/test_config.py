@@ -4,7 +4,9 @@ from stamp.preprocessing.pipeline.config import PipelineConfig, StepName, check_
 
 
 def config(**settings) -> PipelineConfig:
-    return PipelineConfig.model_validate({"clinical_table": "c.csv", **settings})
+    return PipelineConfig.model_validate(
+        {"experiment": "e", "clinical_table": "c.csv", **settings}
+    )
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,8 @@ preprocessing:
   visualisation_max_dimension: 4000
 
 pipeline:
+  experiment: "my_experiment"     # results go in <output_dir>/<experiment>/<run>/
+  # run: "first_n"                # this run's folder; default derived from the settings
   clinical_table: "/path/to/clinical_table.csv"   # Patient, StudyID/SlideID, isLNM, hospital
   order: "extract_then_sample"
 

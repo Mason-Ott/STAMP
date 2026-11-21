@@ -25,6 +25,8 @@ preprocessing:            # unchanged: tiling + extractor settings
   device: cuda
 
 pipeline:
+  experiment: sampling_comparison       # the question; results go in <output_dir>/<experiment>/
+  run: entropy                          # optional: this run's folder name
   clinical_table: /data/clinical.csv   # patient_id, slide_id, label, hospital
   order: sample_then_extract
   sampling: {n_tiles: 8192, strategy: first_n, pad_mode: none}
@@ -35,39 +37,58 @@ pipeline:
 `hospital_patientid`, the same `group_key` the split pipeline uses. All
 settings are documented in `pipeline/config.py` and `distributed/config.py`.
 
-## Outputs (under `preprocessing.output_dir`)
+## Outputs: experiments and runs
 
-Folders are named after the settings behind their contents, so **one
-`output_dir` holds any number of runs** (other extractors, sampling settings,
-orders, encoders) and runs reuse what they share. T = tiling settings (e.g.
-`256um_224px_3fa91c`), G = `T_gap1` (T plus the combine settings), E = the
-extractor, S = the sampling settings (`first_n-8192`, `random-8192`, `tissue-8192`, `spatial-8192-cell8`,
-`full` without sampling):
+Results are organised as `<output_dir>/<experiment>/<run>/`. An **experiment** is
+a question (e.g. "which sampling method?"); a **run** is one answer to try (one
+sampling method, one model). A single run is just an experiment with one run.
 
-| folder | contents |
-|---|---|
-| `tile_positions/T/` | tile positions, one file per slide |
-| `patient_positions/G/` | all tile positions of a patient |
-| `sampled_positions/G/S/` | the sampled tile positions |
-| `slide_features/E/T/` | `extract_then_sample`: per-slide features |
-| `patient_features/E/G/` | `extract_then_sample`: patient features, all tiles |
-| **`features/E/G/S/`** | **training bags**: one per patient, sampled tiles with features |
-| `embeddings/<encoder>/E/G/S/` | one embedding per patient (only with `encoder`) |
-| `overviews/tiles/T/`, `overviews/sampled/G/S/` | thumbnails, if `save_visualisations` |
+```
+<output_dir>/
+`-- sampling_comparison/              the experiment
+    |-- README.md                     index of its runs
+    |-- shared/                       work every run reuses (done once)
+    |   |-- tile_positions/T/            tile positions, one file per slide
+    |   |-- patient_positions/G/         all tile positions of a patient
+    |   |-- slide_features/E/T/          extract_then_sample: per-slide features
+    |   |-- patient_features/E/G/        extract_then_sample: patient features
+    |   `-- overviews/tiles/T/           tile thumbnails
+    |-- entropy/                      one run
+    |   |-- config.yaml                  what the run was made with
+    |   |-- README.md                    steps in order, and where everything is
+    |   |-- sampled_positions/           sample_then_extract: the sampled tiles
+    |   |-- sampled_features/            extract_then_sample: the sampled tiles
+    |   |-- features/                    training bags: one per patient
+    |   |-- embeddings/<encoder>/        one embedding per patient (with an encoder)
+    |   |-- overviews/                   sampling thumbnails (save_visualisations)
+    |   `-- logs/                        worker logs
+    `-- random/ ...
+```
+T = tiling settings (e.g. `256um_224px_3fa91c`), G = `T_gap1` (T plus the combine
+settings), E = the extractor. The shared folders are keyed by the settings that
+shape them, so runs of one experiment can differ in tile size or extractor and
+still share what they can. `pipeline.run` names the run folder; without it the
+name is derived (`<extractor>-<sampling>`, e.g. `conch1_5-first_n-8192`).
+`pipeline.experiment` is required, so runs can't land in the wrong experiment by
+accident.
 
-Both orders end in the same `features/E/G/S/` folder, because they produce the
-same training bags: if one order has run, the other finds the work done. With
-`slide_feat_dir`, T is `imported_<hash>`. Each results folder has a
-`config.yaml` with the configuration it was made with (tile and patient folders are shared by runs with any sampling, so they have none).
-The sampling `seed` is not in the folder name, only in `config.yaml`: running again in
-the same output folder with a different seed (or any other sampling setting that
-the name doesn't show) is rejected, so use another `output_dir` for each seed.
+Each run's **README.md** is generated from its config: it draws the steps in
+order with the settings each uses and where its output goes, and shows the run's
+folder tree. `config.yaml` is the run's configuration (without hosts, locking and
+`--steps`). Run it again with `stamp -c <run>/config.yaml preprocess`; finished
+work is skipped.
 
-What a second run reuses: another `n_tiles`/`strategy` redoes only sampling and
-extraction; another `extractor` redoes only extraction (the tile positions and
-the STAMP tile cache are shared); adding an `encoder` redoes only encoding;
-changing tile size or cutoffs starts from the slides (the tile cache is keyed
-the same way).
+**A run folder is for one set of results.** If it already holds a `config.yaml`
+with different result-shaping settings (sampling incl. the seed, tile settings,
+extractor, order, gap), the run is rejected before anything is written: give it
+another `run` name. Adding an `encoder` to an existing run is fine (embeddings go
+in `embeddings/<encoder>/`).
+
+What another run of the same experiment reuses: everything in `shared/` whose
+settings match. Another `n_tiles`/`strategy` redoes only sampling and extraction;
+another `extractor` redoes extraction (tile positions and the STAMP tile cache are
+shared); changing tile size or cutoffs starts from the slides (the tile cache is
+keyed the same way). Another *experiment* shares nothing but the tile cache.
 
 **Encoding needs a compatible extractor.** An `encoder` only accepts features
 from certain extractors (TITAN: `conch1_5`). With any other extractor the run
@@ -75,7 +96,7 @@ logs a warning and skips the `encode` step; asking for `--steps encode`
 explicitly is an error.
 
 **Intermediate files are kept** (`keep_intermediates: true`, the default), which
-is what makes that reuse possible. Set it to `false` to save disk: a stage's
+is what makes the sharing possible. Set it to `false` to save disk: a stage's
 file is then deleted once the next stage has written its own, so only the latest
 finished stage remains (plus training bags, embeddings and overviews), and a run
 with other settings starts again from the slides. Rerunning the same

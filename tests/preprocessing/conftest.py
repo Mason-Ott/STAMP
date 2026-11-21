@@ -78,6 +78,7 @@ def make_configs(dataset: Dataset, tmp_path: Path):
             max_workers=2,
         )
         settings = {
+            "experiment": "test",
             "clinical_table": dataset.clinical_table,
             "num_workers": 0,
             "coordination": {"poll_interval_s": 0.2},

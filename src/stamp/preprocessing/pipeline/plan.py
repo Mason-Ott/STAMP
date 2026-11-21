@@ -3,33 +3,37 @@
 This is the only module that knows how the steps connect. The steps take input
 paths and an output path, and the scheduler only sees `Step` objects.
 
-Stage folders are named after the settings that shaped their contents, so one
-`output_dir` holds any number of runs (other extractors, sampling settings,
-orders, encoders) and runs share whatever they have in common. With T the tiling
-settings (e.g. `256um_224px_3fa91c`), G = `T_gap1` (the combine settings),
-E the extractor and S the sampling settings (e.g. `first_n-8192`, or `full`):
+Results are organised by experiment and run:
 
-    tile_positions/T/<slide>.h5            tile positions per slide
-    patient_positions/G/<patient>.h5       all tile positions of a patient
-    sampled_positions/G/S/<patient>.h5     the sampled tile positions
-    features/E/G/S/<patient>.h5            sampled tiles with features  <- training
-    embeddings/<encoder>/E/G/S/<patient>.h5   one embedding per patient
+    <output_dir>/<experiment>/
+        shared/                      work every run of the experiment reuses
+            tile_positions/T/            tile positions per slide
+            patient_positions/G/         all tile positions of a patient
+            slide_features/E/T/          extract_then_sample: per-slide features
+            patient_features/E/G/        extract_then_sample: patient features
+            overviews/tiles/T/           tile thumbnails
+        <run>/                       one run (a sampling method, a model, ...)
+            config.yaml  README.md       what it ran with, and a guide to the folder
+            sampled_positions/           sample_then_extract: the sampled tiles
+            sampled_features/            extract_then_sample: the sampled tiles
+            features/                    training bags (sampled tiles with features)
+            embeddings/<encoder>/        one embedding per patient (with an encoder)
+            overviews/                   sampling thumbnails (save_visualisations)
+            logs/                        worker logs
 
-extract_then_sample uses `slide_features/E/T`, `patient_features/E/G` and
-`sampled_features/E/G/S` instead of the positions folders, and ends in the
-same `features/E/G/S` folder: both orders make the same training bags, so
-whichever ran first has done the work for the other. Alongside: `overviews/`
-(thumbnails, if save_visualisations), `logs/` (workers).
+T = tiling settings (e.g. `256um_224px_3fa91c`), G = `T_gap1`, E = the extractor.
+The shared folders are keyed by the settings that shape them, so runs of one
+experiment can differ in tile size or extractor and still share what they can.
+README.md in each run (see `describe.py`) draws the steps and lists the folders.
 
-Files of earlier stages are kept (`keep_intermediates`, the default), which is
-what lets a second run reuse them. Without it, a stage's files are deleted once
-the next stage has written its own, so a run can't be repeated with other
-sampling settings.
+Unless keep_intermediates is false (the default is true), earlier stages' files are
+kept, which is what lets runs reuse them. Without it, a stage's files are deleted
+once the next stage has written its own, so another run can't reuse them.
 """
 
 import hashlib
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -42,6 +46,7 @@ from stamp.encoding.encoder import Encoder
 from stamp.preprocessing.config import PreprocessingConfig
 from stamp.preprocessing.data.clinical import Patient, Slide
 from stamp.preprocessing.extractor import Extractor
+from stamp.preprocessing.pipeline import describe
 from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
 from stamp.preprocessing.steps import (
     combine,
@@ -64,7 +69,7 @@ SLIDE_STEPS = frozenset(
 """Steps that write one file per slide; the others write one file per patient."""
 
 CONFIG_FILE = "config.yaml"
-"""Written into the result folders of a run: the configuration it ran with."""
+"""Written into the run folder: the configuration it ran with."""
 
 
 @dataclass(frozen=True)
@@ -75,29 +80,47 @@ class Stage:
     kept: bool
     """Never deleted by later stages (training features, embeddings)."""
 
+    shared: bool = False
+    """Lives in the experiment's shared folder (used by all its runs)."""
+
     def file_of(self, item: Slide | Patient) -> Path:
         return self.folder / f"{item.file_stem}.h5"
 
 
 @dataclass(frozen=True)
 class Layout:
-    root: Path
+    experiment_dir: Path
+    run_dir: Path
     stages: tuple[Stage, ...]
     tile_overviews: Path
     sampling_overviews: Path
+
+    @property
+    def shared_dir(self) -> Path:
+        return self.experiment_dir / "shared"
+
+    @property
+    def logs(self) -> Path:
+        return self.run_dir / "logs"
 
     def stage(self, step: StepName) -> Stage:
         return next(stage for stage in self.stages if stage.step == step)
 
     @property
     def training_bags(self) -> Path:
-        """The `features/...` folder: the last stage before encoding."""
+        """The run's `features` folder: the last stage before encoding."""
         return [s for s in self.stages if s.step != StepName.ENCODE][-1].folder
 
     @property
     def embeddings(self) -> Path | None:
         encoding = [s for s in self.stages if s.step == StepName.ENCODE]
         return encoding[0].folder if encoding else None
+
+
+def run_name(pre: PreprocessingConfig, cfg: PipelineConfig) -> str:
+    """The run's folder name: `pipeline.run`, or derived from the extractor and
+    the sampling settings."""
+    return cfg.run or f"{pre.extractor}-{cfg.sampling.tag}"
 
 
 def encoding_possible(pre: PreprocessingConfig, cfg: PipelineConfig) -> bool:
@@ -120,7 +143,10 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
     extractor = str(pre.extractor)
     base = _base_tag(pre, cfg)
     patient = f"{base}_gap{cfg.virtual_gap_tiles}"
-    sampling = cfg.sampling.tag
+
+    experiment_dir = pre.output_dir / cfg.experiment
+    run_dir = experiment_dir / run_name(pre, cfg)
+    shared_dir = experiment_dir / "shared"
 
     stages = []
     has_feats = False
@@ -130,41 +156,40 @@ def layout_for(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
             StepName.EXTRACT_SLIDES,
             StepName.EXTRACT,
         )
+        shared = False
         if step == StepName.ENCODE:
-            relative = Path(
-                "embeddings", str(cfg.encoder), extractor, patient, sampling
-            )
+            folder = run_dir / "embeddings" / str(cfg.encoder)
         elif step == last_data_step:
-            relative = Path("features", extractor, patient, sampling)
+            folder = run_dir / "features"
+        elif step == StepName.SAMPLE:
+            folder = run_dir / (
+                "sampled_features" if has_feats else "sampled_positions"
+            )
         else:
-            relative = _folder(step, has_feats, extractor, base, patient, sampling)
+            folder = shared_dir / _shared_folder(
+                step, has_feats, extractor, base, patient
+            )
+            shared = True
         stages.append(
             Stage(
                 step=step,
-                folder=pre.output_dir / relative,
+                folder=folder,
                 per_slide=step in SLIDE_STEPS,
                 kept=step in (last_data_step, StepName.ENCODE),
+                shared=shared,
             )
         )
     return Layout(
-        root=pre.output_dir,
+        experiment_dir=experiment_dir,
+        run_dir=run_dir,
         stages=tuple(stages),
-        tile_overviews=pre.output_dir / "overviews" / "tiles" / base,
-        sampling_overviews=pre.output_dir
-        / "overviews"
-        / "sampled"
-        / patient
-        / sampling,
+        tile_overviews=shared_dir / "overviews" / "tiles" / base,
+        sampling_overviews=run_dir / "overviews",
     )
 
 
-def _folder(
-    step: StepName,
-    has_feats: bool,
-    extractor: str,
-    base: str,
-    patient: str,
-    sampling: str,
+def _shared_folder(
+    step: StepName, has_feats: bool, extractor: str, base: str, patient: str
 ) -> Path:
     match step:
         case StepName.TILE:
@@ -175,11 +200,7 @@ def _folder(
             return Path("patient_features", extractor, patient)
         case StepName.COMBINE:
             return Path("patient_positions", patient)
-        case StepName.SAMPLE if has_feats:
-            return Path("sampled_features", extractor, patient, sampling)
-        case StepName.SAMPLE:
-            return Path("sampled_positions", patient, sampling)
-    raise ValueError(f"no folder for step {step}")
+    raise ValueError(f"no shared folder for step {step}")
 
 
 def _base_tag(pre: PreprocessingConfig, cfg: PipelineConfig) -> str:
@@ -346,7 +367,7 @@ def _import_settings(
     )
 
 
-def run_config(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, object]:
+def run_config(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, Any]:
     """The configuration a run used, as written to `config.yaml`. Leaves out what
     doesn't change the results (hosts, locking, which steps were asked for)."""
     return {
@@ -357,62 +378,86 @@ def run_config(pre: PreprocessingConfig, cfg: PipelineConfig) -> dict[str, objec
     }
 
 
-def record_run_config(
-    pre: PreprocessingConfig, cfg: PipelineConfig, steps: Sequence[StepName]
-) -> None:
-    """Write `config.yaml` into the result folders of the steps about to run.
+def prepare_run(pre: PreprocessingConfig, cfg: PipelineConfig) -> Layout:
+    """Create the run's folder with its `config.yaml`, `README.md`, and the
+    experiment's index, before any step runs.
 
-    A folder is named after the settings that shape its contents, except the
-    sampling seed. So if a folder already holds results made with different
-    sampling settings (another seed), stop: they would be mixed up with, or
-    mistaken for, the new ones.
+    A run folder is for one set of results. If it already holds a config with
+    different result-shaping settings (another seed, tile size, extractor, ...),
+    stop: the new results would be mixed up with, or mistaken for, the old ones.
     """
     layout = layout_for(pre, cfg)
-    folders = [
-        stage.folder
-        for stage in layout.stages
-        if stage.step in steps and stage.step in _SETTINGS_DEPENDENT_STEPS
-    ]
-    if StepName.SAMPLE in steps and pre.save_visualisations:
-        folders.append(layout.sampling_overviews)
-
     config = run_config(pre, cfg)
-    text = (
-        "# The configuration this folder's contents were made with.\n"
-        + yaml.safe_dump(config, sort_keys=False)
+    path = layout.run_dir / CONFIG_FILE
+    if path.exists():
+        _check_same_run(layout.run_dir, yaml.safe_load(path.read_text()), config)
+
+    layout.run_dir.mkdir(parents=True, exist_ok=True)
+    _write_if_changed(
+        path,
+        "# The configuration this run was made with.\n"
+        + yaml.safe_dump(config, sort_keys=False),
     )
-    for folder in folders:
-        path = folder / CONFIG_FILE
-        if path.exists():
-            recorded = yaml.safe_load(path.read_text())
-            _check_same_sampling(folder, recorded, config)
-            if path.read_text() == text:
-                continue
-        folder.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(text)
-        tmp.replace(path)
+    _write_if_changed(
+        layout.run_dir / "README.md", describe.describe_run(pre, cfg, layout)
+    )
+    _write_if_changed(
+        layout.experiment_dir / "README.md",
+        describe.describe_experiment(layout.experiment_dir),
+    )
+    return layout
 
 
-_SETTINGS_DEPENDENT_STEPS = (StepName.SAMPLE, StepName.EXTRACT, StepName.ENCODE)
-"""Steps whose result folder depends on the sampling settings (the tiling and
-patient folders are shared by runs with any sampling)."""
-
-
-def _check_same_sampling(
-    folder: Path, recorded: dict[str, Any], current: dict[str, object]
-) -> None:
-    old = recorded["pipeline"]["sampling"]
-    new = current["pipeline"]["sampling"]  # type: ignore[index]
-    if old == new:
+def _write_if_changed(path: Path, text: str) -> None:
+    if path.exists() and path.read_text() == text:
         return
-    changed = "; ".join(
-        f"{key}: {old.get(key)!r} -> {new.get(key)!r}"
-        for key in sorted(set(old) | set(new))
-        if old.get(key) != new.get(key)
-    )
-    raise ValueError(
-        f"{folder} holds results made with different sampling settings "
-        f"({changed}). The folder name doesn't include everything that can differ "
-        "(e.g. the seed), so use a different preprocessing.output_dir for this run."
-    )
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def _identity(config: dict[str, Any]) -> dict[str, Any]:
+    """The settings of a config that shape a run's results (not, e.g., the
+    encoder: embeddings of several encoders can sit in one run)."""
+    pre, pipeline = config["preprocessing"], config["pipeline"]
+    return {
+        "sampling": pipeline["sampling"],
+        "order": pipeline["order"],
+        "drop_edge_tiles": pipeline["drop_edge_tiles"],
+        "virtual_gap_tiles": pipeline["virtual_gap_tiles"],
+        "slide_feat_dir": pipeline["slide_feat_dir"],
+        **{
+            key: pre[key]
+            for key in (
+                "extractor",
+                "tile_size_um",
+                "tile_size_px",
+                "brightness_cutoff",
+                "canny_cutoff",
+            )
+        },
+    }
+
+
+def _check_same_run(
+    run_dir: Path, recorded: dict[str, Any], current: dict[str, Any]
+) -> None:
+    old, new = _identity(recorded), _identity(current)
+    changes = []
+    for key in old:
+        if old[key] == new[key]:
+            continue
+        if isinstance(old[key], dict):
+            changes += [
+                f"{key}.{k}: {old[key].get(k)!r} -> {new[key].get(k)!r}"
+                for k in sorted(set(old[key]) | set(new[key]))
+                if old[key].get(k) != new[key].get(k)
+            ]
+        else:
+            changes.append(f"{key}: {old[key]!r} -> {new[key]!r}")
+    if changes:
+        raise ValueError(
+            f"{run_dir} already holds results made with different settings "
+            f"({'; '.join(changes)}). Give this run another name (pipeline.run) "
+            "or experiment."
+        )
