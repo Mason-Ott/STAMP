@@ -5,7 +5,9 @@
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml stop --n-tiles 1024
 
 Actions: `configs` (only write the configs and show the plan), `start`, `status`,
-`stop`. Run it from the STAMP folder, with the environment active.
+`stop`. Run it from the STAMP folder, with the environment active. `start` first
+checks that every host accepts a passwordless ssh login and starts nothing if one
+does not (it says why). Hosts are contacted in parallel.
 
 Strategy i of the sweep goes to host i of `pipeline.workers.hosts` (wrapping
 around if there are more strategies than hosts; then a host runs two at once).
@@ -22,11 +24,14 @@ own folder, e.g. `overviews/sampled/<patient folder>/<strategy>-<n_tiles>/`.
 
 import argparse
 import subprocess
-import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+from stamp.distributed.config import WorkersConfig
+from stamp.distributed.remote import SSH_OPTIONS, RemoteRun, host_states, start, stop
 
 STEPS = {
     "first_n": "tile,combine,sample",
@@ -92,6 +97,62 @@ def write_configs(variants: list[Variant], out_dir: Path) -> dict[str, Path]:
     return paths
 
 
+def remote_run(variant: Variant, config_file: Path) -> RemoteRun:
+    workers = variant.config["pipeline"]["workers"]
+    return RemoteRun(
+        config_file=config_file,
+        output_dir=Path(variant.config["preprocessing"]["output_dir"]).resolve(),
+        workers=WorkersConfig(**workers),
+        project_dir=workers.get("project_dir") or str(Path.cwd()),
+    )
+
+
+def check_ssh(host: str) -> str | None:
+    """None if `ssh host` works without a password, else why not."""
+    try:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTIONS, host, "true"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    if result.returncode == 0:
+        return None
+    lines = result.stderr.strip().splitlines()
+    return lines[-1] if lines else f"ssh exit code {result.returncode}"
+
+
+def check_hosts(hosts: list[str]) -> dict[str, str | None]:
+    with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as pool:
+        return dict(zip(hosts, pool.map(check_ssh, hosts), strict=True))
+
+
+def parallel[T](function, items: list) -> list[T]:
+    with ThreadPoolExecutor(max_workers=max(1, len(items))) as pool:
+        return list(pool.map(function, items))
+
+
+def show_progress(variants: list[Variant], paths: dict[str, Path]) -> None:
+    """Per strategy: how far its steps have got (reads the output files)."""
+    # imported late: loads the models' libraries, which takes a while
+    from stamp.preprocessing.config import PreprocessingConfig
+    from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
+    from stamp.preprocessing.pipeline.run import pipeline_progress
+
+    print("\nprogress (done/total):")
+    for variant in variants:
+        pre = PreprocessingConfig.model_validate(variant.config["preprocessing"])
+        cfg = PipelineConfig.model_validate(variant.config["pipeline"])
+        progress = pipeline_progress(pre, cfg)
+        cells = [
+            f"{step} {progress[StepName(step)].done}/{progress[StepName(step)].total}"
+            for step in variant.steps.split(",")
+        ]
+        print(f"  {variant.strategy:<13} " + "   ".join(cells))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -107,6 +168,9 @@ def main() -> None:
     parser.add_argument(
         "--force", action="store_true", help="stop: kill workers immediately"
     )
+    parser.add_argument(
+        "--no-progress", action="store_true", help="status: skip the progress table"
+    )
     args = parser.parse_args()
 
     base = yaml.safe_load(args.base_config.read_text())
@@ -115,27 +179,66 @@ def main() -> None:
         args.out_dir or Path("configs/sweeps") / f"sampling_{args.n_tiles}"
     ).resolve()
     paths = write_configs(variants, out_dir)
+    runs = {v.strategy: remote_run(v, paths[v.strategy]) for v in variants}
 
+    print(f"configs in {out_dir}")
     for variant in variants:
-        path = paths[variant.strategy]
-        print(f"\n== {variant.strategy} on {variant.host}: {path}")
-        if args.action == "configs":
-            print(f"   steps: {variant.steps}")
-            continue
-        command = [
-            sys.executable,
-            "-m",
-            "stamp",
-            "-c",
-            str(path),
-            "workers",
-            args.action,
-        ]
-        if args.action == "start":
-            command += ["--steps", variant.steps]
-        if args.action == "stop" and args.force:
-            command.append("--force")
-        subprocess.run(command, check=False)
+        print(f"  {variant.strategy:<13} {variant.host:<12} steps: {variant.steps}")
+    if args.action == "configs":
+        return
+
+    hosts = [v.host for v in variants]
+    reasons = check_hosts(sorted(set(hosts)))
+    broken = {host: why for host, why in reasons.items() if why}
+    if broken:
+        print("\nhosts that do not accept a passwordless ssh login:")
+        for host, why in broken.items():
+            print(f"  {host}: {why}")
+        print(
+            "\nFor 'Permission denied', run once per host: "
+            "ssh-copy-id -i ~/.ssh/id_ed25519.pub <host>\n"
+            "Replace hosts that do not exist (Could not resolve) in the config, or "
+            "choose hosts with --hosts."
+        )
+
+    match args.action:
+        case "start":
+            if broken:
+                print("\nnothing started.")
+                raise SystemExit(1)
+            outcomes = parallel(
+                lambda v: start(runs[v.strategy], [v.host], ["--steps", v.steps])[
+                    v.host
+                ],
+                variants,
+            )
+            print()
+            for variant, outcome in zip(variants, outcomes, strict=True):
+                print(f"{variant.strategy:<13} {variant.host:<12} {outcome}")
+            print(f"\nlogs: {next(iter(runs.values())).log_file('<host>')}")
+            print("check progress with the `status` action")
+        case "stop":
+            outcomes = parallel(
+                lambda v: stop(runs[v.strategy], [v.host], force=args.force)[v.host],
+                [v for v in variants if v.host not in broken],
+            )
+            for variant, outcome in zip(
+                [v for v in variants if v.host not in broken], outcomes, strict=True
+            ):
+                print(f"{variant.strategy:<13} {variant.host:<12} {outcome}")
+        case "status":
+            reachable = [v for v in variants if v.host not in broken]
+            states = parallel(
+                lambda v: host_states(runs[v.strategy], [v.host])[v.host].value,
+                reachable,
+            )
+            state_of = {v.strategy: s for v, s in zip(reachable, states, strict=True)}
+            print()
+            for variant in variants:
+                state = state_of.get(variant.strategy, "unreachable")
+                print(f"{variant.strategy:<13} {variant.host:<12} worker {state}")
+            if not args.no_progress:
+                show_progress(variants, paths)
 
 
 if __name__ == "__main__":
