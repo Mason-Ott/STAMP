@@ -228,3 +228,70 @@ def test_many_threads_creating_the_same_folders_all_succeed(tmp_path):
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not errors
+
+
+def test_refresh_listing_lists_the_nearest_existing_folder(tmp_path, monkeypatch):
+    from stamp.distributed import fs
+
+    listed = []
+    real_listdir = os.listdir
+    monkeypatch.setattr(
+        fs.os, "listdir", lambda path: listed.append(Path(path)) or real_listdir(path)
+    )
+    (tmp_path / "shared").mkdir()
+    fs.refresh_listing(tmp_path / "shared" / "patients" / "G")
+    # `patients` doesn't exist (here), so it's `shared` that gets re-read
+    assert listed[-1] == tmp_path / "shared"
+    fs.refresh_listing(tmp_path / "nothing" / "here")
+    assert listed[-1] == tmp_path
+
+
+def test_ensure_dir_refreshes_the_stale_folder_before_retrying(tmp_path, monkeypatch):
+    """On network storage the folder another machine just created still looks
+    missing here; only re-reading its parent makes mkdir work again."""
+    from stamp.distributed import fs
+
+    refreshed = []
+    stale = {"on": True}
+    real_mkdir = Path.mkdir
+
+    def stale_mkdir(self, *args, **kwargs):
+        if stale["on"]:
+            raise FileExistsError(self)
+        return real_mkdir(self, *args, **kwargs)
+
+    def refresh(path):
+        refreshed.append(path)
+        stale["on"] = False  # the re-read clears the stale entry
+
+    monkeypatch.setattr(Path, "mkdir", stale_mkdir)
+    monkeypatch.setattr(fs, "refresh_listing", refresh)
+    monkeypatch.setattr(fs.time, "sleep", lambda s: None)
+    target = tmp_path / "shared" / "patients"
+    fs.ensure_dir(target)
+    assert refreshed == [target] and target.is_dir()
+
+
+def test_an_input_finished_elsewhere_is_not_reported_missing(tmp_path, monkeypatch):
+    """The producer finished and released its lock, but this machine's view of the
+    folder is stale: re-reading the folder reveals the file."""
+    from stamp.distributed import workqueue
+
+    path = tmp_path / "input.h5"
+
+    def reveal(folder):
+        path.write_text("")
+
+    monkeypatch.setattr(workqueue, "refresh_listing", reveal)
+    state = wait_for(path, stale_after_s=60, poll_interval_s=0.01)
+    assert state is InputState.READY
+
+
+def test_every_produced_item_is_logged(tmp_path, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="stamp"):
+        run_step(step(tmp_path, ["a", "b"]), FAST)
+    messages = [r.message for r in caplog.records]
+    assert any(m.startswith("test: a.out done") for m in messages)
+    assert any(m.startswith("test: b.out done") for m in messages)

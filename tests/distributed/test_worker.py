@@ -66,7 +66,10 @@ def test_ignores_other_users_when_told_to(monkeypatch):
     assert worker.run_as_worker(lambda: True, relaxed) == worker.EXIT_OK
 
 
-@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize(
+    "stop_signal",
+    [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],  # HUP: screen quit
+)
 def test_stop_signal_unwinds_cleanly(tmp_path, monkeypatch, stop_signal):
     monkeypatch.setattr(worker, "other_users", lambda: [])
     job, held = blocked_job(tmp_path)

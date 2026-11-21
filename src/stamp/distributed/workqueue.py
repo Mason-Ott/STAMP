@@ -29,7 +29,7 @@ from typing import Generic, TypeVar
 from tqdm import tqdm
 
 from stamp.distributed.config import CoordinationConfig
-from stamp.distributed.fs import ensure_dir
+from stamp.distributed.fs import ensure_dir, refresh_listing
 
 _logger = logging.getLogger("stamp")
 
@@ -137,9 +137,14 @@ def run_step(step: Step[T], coordination: CoordinationConfig) -> StepReport:
             elif step.is_done(item):  # another machine finished it after our check
                 report.already_done += 1
             else:
+                started = time.monotonic()
                 outcome = _run_item(step, item, output, coordination)
                 if outcome is _Outcome.DONE:
                     report.done += 1
+                    _logger.info(
+                        f"{step.name}: {output.name} done "
+                        f"({time.monotonic() - started:.0f} s)"
+                    )
                 elif outcome is _Outcome.MISSING_INPUTS:
                     report.missing_inputs += 1
                 else:
@@ -228,6 +233,13 @@ def wait_for(path: Path, *, stale_after_s: float, poll_interval_s: float) -> Inp
         if failed_path(path).exists():
             return InputState.FAILED
         if not _is_locked(path, stale_after_s):
+            # The producer may have just finished and released its lock: on
+            # network storage this machine can still see the folder as it was.
+            refresh_listing(path.parent)
+            if path.exists():
+                return InputState.READY
+            if failed_path(path).exists():
+                return InputState.FAILED
             return InputState.MISSING
         if not announced:
             _logger.info(f"waiting for {path} (being produced elsewhere)")

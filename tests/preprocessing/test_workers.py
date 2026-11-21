@@ -202,15 +202,17 @@ def test_start_twice_and_stop_cleanly(fake_cluster, remote_run):
     assert stop(remote_run, ["hostA"], force=False) == {"hostA": "no worker running"}
 
 
-def test_force_stop_kills_the_session(fake_cluster, remote_run):
+def test_force_stop_ends_the_session_and_the_worker_unwinds(fake_cluster, remote_run):
     held = blocked_run(remote_run)
     start(remote_run, ["hostA"], COMBINE_ONLY)
     _wait_for(lambda: lock_path(held).exists(), "worker to claim H1_P1")
 
     stop(remote_run, ["hostA"], force=True)
     wait_until_stopped(remote_run, ["hostA"], timeout_s=30)
-    # Killed without cleanup: the lock stays until it goes stale.
-    assert lock_path(held).exists()
+    # The session's hangup is handled like a stop request: the worker logs it and
+    # releases its lock instead of leaving one to go stale.
+    _wait_for(lambda: not lock_path(held).exists(), "the lock to be released")
+    assert "stopped on request" in remote_run.log_file("hostA").read_text()
 
 
 def _wait_for(condition, what: str, timeout_s: float = 120) -> None:
