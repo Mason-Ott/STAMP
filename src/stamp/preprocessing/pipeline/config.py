@@ -4,6 +4,7 @@ Tiling and extractor settings stay in STAMP's own PreprocessingConfig
 (`preprocessing:` section); this adds what the patient-level stages need.
 """
 
+import re
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
@@ -120,8 +121,8 @@ class SamplingConfig(BaseModel):
     repeat: cycle through the patient's tiles again (mask=True)."""
 
     seed: int = 0
-    """Not part of the folder name; recorded in the folder's config.yaml, and a
-    run with another seed in the same folder is rejected (use another output_dir)."""
+    """Recorded in the run's config.yaml; a run folder that already holds results
+    made with another seed is rejected (give the run another name)."""
 
     background_cutoff: int = Field(default=220, gt=0, lt=256)
     """tissue only: a pixel counts as background if its grey value (0-255) is at
@@ -223,6 +224,16 @@ class PipelineConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    experiment: str
+    """Name of the experiment (a question you answer with one or more runs). Its
+    results go in `<output_dir>/<experiment>/`: a `shared/` folder for the work all
+    its runs reuse (tiling, combining, slide features), and one folder per run."""
+
+    run: str | None = None
+    """Name of this run's folder inside the experiment. Default: derived from the
+    extractor and sampling settings (e.g. `conch1_5-first_n-8192`). A sweep gives
+    every run its own name."""
+
     clinical_table: Path
     """CSV with patient_id, slide_id, label, hospital (or the aliases in `columns`)."""
 
@@ -278,6 +289,19 @@ class PipelineConfig(BaseModel):
 
     workers: WorkersConfig | None = None
     """Hosts to run on with `stamp workers start`. Not needed to run locally."""
+
+    @model_validator(mode="after")
+    def _check_names(self) -> "PipelineConfig":
+        for field, name in (("experiment", self.experiment), ("run", self.run)):
+            if name is None:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+                raise ValueError(
+                    f"pipeline.{field} {name!r}: use letters, digits, _ - and . only"
+                )
+            if name == "shared":
+                raise ValueError(f"pipeline.{field} can't be 'shared' (reserved)")
+        return self
 
     @model_validator(mode="after")
     def _check(self) -> "PipelineConfig":

@@ -117,8 +117,10 @@ def start(
 def stop(run: RemoteRun, hosts: Sequence[str], *, force: bool) -> dict[str, str]:
     """Ask each host's worker to stop (SIGTERM), or kill its session if `force`.
 
-    A normal stop lets the worker release its locks. A forced stop doesn't, so
-    its unfinished item waits until the lock goes stale.
+    A normal stop signals the worker itself; a forced stop ends the whole screen
+    session (the worker gets a hangup, handled like a stop, but its DataLoader
+    children and anything slow to unwind are cut off). If the worker doesn't get to
+    release its lock, its unfinished item waits until the lock goes stale.
     """
     if force:
         command = f"screen -S {run.session} -X quit"

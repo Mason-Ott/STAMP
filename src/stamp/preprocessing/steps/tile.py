@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from stamp.distributed.fs import ensure_dir
 from stamp.preprocessing.config import PreprocessingConfig
 from stamp.preprocessing.data.bags import Bag, SlideInfo, write_bag
 from stamp.preprocessing.data.clinical import Slide
@@ -121,7 +122,7 @@ def ensure_tile_cache(slide_path: Path, settings: TilingSettings) -> Path:
     if cache_file.exists():
         return cache_file
 
-    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(settings.cache_dir)
     tiles = tiles_with_cache(
         slide_path,
         cache_dir=settings.cache_dir,

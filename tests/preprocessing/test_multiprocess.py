@@ -30,6 +30,7 @@ def test_processes_split_the_work_and_wait_for_each_other(dataset, tmp_path: Pat
                     "max_workers": 2,
                 },
                 "pipeline": {
+                    "experiment": "e",
                     "clinical_table": str(dataset.clinical_table),
                     "sampling": {"n_tiles": 50},
                     "coordination": {"poll_interval_s": 0.5},
@@ -59,10 +60,10 @@ def test_processes_split_the_work_and_wait_for_each_other(dataset, tmp_path: Pat
 
     sampled = {
         path.stem: read_bag(path).sampling.per_slide
-        for path in out.glob("sampled_positions/*/*/*.h5")
+        for path in out.glob("e/*/sampled_positions/*.h5")
     }
     assert sampled == {"H1_P1": [25, 25], "H1_P2": [36, 7], "H2_P1": [8]}
-    for path in out.glob("sampled_positions/*/*/*.h5"):
+    for path in out.glob("e/*/sampled_positions/*.h5"):
         assert np.all(read_bag(path).mask)
 
 

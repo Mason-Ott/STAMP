@@ -3,7 +3,8 @@
 Colours: green tiles are used, red tiles were kept by tiling but not sampled.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import numpy.typing as npt
 import openslide
 from PIL import Image, ImageDraw
 
+from stamp.distributed.fs import ensure_dir
 from stamp.preprocessing.data.bags import SlideInfo
 
 USED_STYLE = {"fill": (0, 170, 0, 70), "outline": (0, 140, 0, 220)}
@@ -69,7 +71,7 @@ def save_tile_overview(
     draw.rectangle((0, 0, 7 * len(caption) + 12, 22), fill=(255, 255, 255, 200))
     draw.text((6, 5), caption, fill=(0, 0, 0, 255))
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(output.parent)
     Image.alpha_composite(thumbnail, overlay).convert("RGB").save(output)
 
 
@@ -98,14 +100,87 @@ def save_patient_overview(
     image = draw_patient_overview(
         panels, tile_size_um=tile_size_um, title=title, max_dimension=max_dimension
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(output.parent)
     image.save(output)
 
 
 def read_thumbnail(slide: SlideInfo, max_dimension: int) -> Image.Image:
+    """A thumbnail of the whole slide, at most `max_dimension` on its longest side.
+
+    Some scans have damaged low-resolution layers (OpenSlide then fails with e.g.
+    "Not a JPEG file") although the full-resolution data is fine, which is all that
+    tiling needs. For those, the thumbnail is built from the coarsest layer that
+    can still be read.
+    """
     wsi = openslide.open_slide(slide.slide_path)
     try:
         return wsi.get_thumbnail((max_dimension, max_dimension)).convert("RGB")
+    except openslide.OpenSlideError:
+        pass
+    finally:
+        wsi.close()
+    return _thumbnail_from_readable_level(slide.slide_path, max_dimension)
+
+
+CHUNK_PX = 2048
+"""Size of the pieces a damaged slide's thumbnail is assembled from."""
+
+
+def _thumbnail_from_readable_level(path: str, max_dimension: int) -> Image.Image:
+    """Assemble a thumbnail from the coarsest layer that reads. A piece that can't
+    be read stays white, so one bad tile doesn't lose the whole picture."""
+    # After an error OpenSlide keeps failing on that handle, so every probe and the
+    # reading itself use a fresh one.
+    with _opened(path) as wsi:
+        n_levels = wsi.level_count
+    for level in range(n_levels - 1, -1, -1):
+        with _opened(path) as wsi:
+            width, height = wsi.level_dimensions[level]
+            downsample = wsi.level_downsamples[level]
+            try:
+                wsi.read_region((0, 0), level, (min(64, width), min(64, height)))
+                wsi.read_region(
+                    (int(width * downsample / 2), int(height * downsample / 2)),
+                    level,
+                    (min(64, width), min(64, height)),
+                )
+            except openslide.OpenSlideError:
+                continue
+        return _assemble(path, level, max_dimension)
+    raise RuntimeError(f"no layer of {path} can be read")
+
+
+def _assemble(path: str, level: int, max_dimension: int) -> Image.Image:
+    with _opened(path) as wsi:
+        width, height = wsi.level_dimensions[level]
+        downsample = wsi.level_downsamples[level]
+    scale = min(1.0, max_dimension / max(width, height))
+    canvas = Image.new(
+        "RGB", (max(1, round(width * scale)), max(1, round(height * scale))), "white"
+    )
+    for y in range(0, height, CHUNK_PX):
+        for x in range(0, width, CHUNK_PX):
+            size = (min(CHUNK_PX, width - x), min(CHUNK_PX, height - y))
+            try:
+                with _opened(path) as wsi:  # a fresh handle: errors are sticky
+                    piece = wsi.read_region(
+                        (int(x * downsample), int(y * downsample)), level, size
+                    )
+            except openslide.OpenSlideError:
+                continue
+            target = (max(1, round(size[0] * scale)), max(1, round(size[1] * scale)))
+            canvas.paste(
+                piece.convert("RGB").resize(target, Image.Resampling.LANCZOS),
+                (round(x * scale), round(y * scale)),
+            )
+    return canvas
+
+
+@contextmanager
+def _opened(path: str) -> Iterator[openslide.OpenSlide]:
+    wsi = openslide.open_slide(path)
+    try:
+        yield wsi
     finally:
         wsi.close()
 

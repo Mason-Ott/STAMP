@@ -18,20 +18,24 @@ given a strategy) until one starts it: it just runs `ssh host ...`. A host that
 accepts your key needs nothing. A host that asks for a password asks you on the
 terminal: type it, or press Enter to skip that host. If a host fails for any
 reason (no such host, wrong password, unreachable) the next one is tried. Put more
-hosts in the pool than strategies to have spares. If the pool runs out, the
+hosts in the pool than strategies to have spares: once every strategy has a host,
+the spare hosts join the most expensive runs as helpers (extracting features,
+reading tile images), taking turns. They share a run's work through lock files, so
+nothing is done twice (`--no-helpers` leaves them idle). If the pool runs out, the
 strategies still without a host are listed with the command to start them.
 
 The connection stays open for a few hours, so `status` and `stop` do not ask for
 the password again. Each strategy gets its own config: a copy of the base config
 with the strategy and `n_tiles` set, no encoder, visualisations on, and
 `workers.hosts` set to its host. They are written to `--out-dir` (default
-`configs/sweeps/sampling_<n_tiles>`, which must be on storage every host sees) and
+`configs/sweeps/<experiment>`, which must be on storage every host sees) and
 started with `stamp workers start`, so logs and progress work as for any run
 (`<output_dir>/logs/<host>.log`). `status` and `stop` use the hosts recorded there.
 
-All strategies share the base config's `output_dir`: tiling and combining are done
-once between them (the hosts split the slides), and each strategy then writes its
-own folder, e.g. `overviews/sampled/<patient folder>/<strategy>-<n_tiles>/`.
+The sweep is one experiment (`pipeline.experiment` in the base config) with one run
+per strategy: `<output_dir>/<experiment>/<strategy>/` holds that run's config.yaml,
+README.md, sampled tiles, thumbnails and logs. Tiling and combining are done once
+for all runs, in `<output_dir>/<experiment>/shared/` (the hosts split the slides).
 """
 
 import argparse
@@ -61,12 +65,31 @@ STEPS = {
 """Strategy -> pipeline steps to run for it (comma separated)."""
 
 
+COST_ORDER = [
+    "conch_kmeans",  # extracts features of every tile on a GPU
+    "texture",
+    "yottixel",
+    "entropy",
+    "tissue",  # these four read every tile image
+    "spatial",
+    "random",
+    "first_n",  # positions only
+]
+"""Strategies, most expensive first: spare hosts help in this order."""
+
+
 @dataclass(frozen=True)
 class Variant:
     strategy: str
     host: str
     steps: str
     config: dict
+    helpers: tuple[str, ...] = ()
+    """Further hosts working on the same run (see `add_helpers`)."""
+
+    @property
+    def hosts(self) -> list[str]:
+        return [self.host, *self.helpers] if self.host else []
 
 
 # --- planning (no ssh) ---------------------------------------------------------
@@ -80,6 +103,8 @@ def plan_variants(
     workers = base.get("pipeline", {}).get("workers")
     if not workers or not (hosts or workers.get("hosts")):
         raise ValueError("the config needs pipeline.workers.hosts (or pass --hosts)")
+    if not base["pipeline"].get("experiment"):
+        raise ValueError("the config needs pipeline.experiment (the sweep's name)")
     hosts = hosts or workers["hosts"]
 
     variants = []
@@ -94,6 +119,12 @@ def plan_variants(
             if strategy == "conch_kmeans"
             else "sample_then_extract"
         )
+        pipeline["run"] = strategy
+        # workers waiting for each other's items check often: the items are short
+        pipeline["coordination"] = {
+            "poll_interval_s": 5.0,
+            **pipeline.get("coordination", {}),
+        }
         pipeline["sampling"] = {
             **pipeline.get("sampling", {}),
             "strategy": strategy,
@@ -104,10 +135,18 @@ def plan_variants(
 
 
 def with_host(variant: Variant, host: str) -> Variant:
+    return _with_hosts(variant, host, ())
+
+
+def with_helpers(variant: Variant, helpers: list[str]) -> Variant:
+    return _with_hosts(variant, variant.host, tuple(helpers))
+
+
+def _with_hosts(variant: Variant, host: str, helpers: tuple[str, ...]) -> Variant:
     config = yaml.safe_load(yaml.safe_dump(variant.config))
     workers = config["pipeline"]["workers"]
-    config["pipeline"]["workers"] = {**workers, "hosts": [host]}
-    return dataclasses.replace(variant, host=host, config=config)
+    config["pipeline"]["workers"] = {**workers, "hosts": [host, *helpers]}
+    return dataclasses.replace(variant, host=host, helpers=helpers, config=config)
 
 
 def write_configs(variants: list[Variant], out_dir: Path) -> dict[str, Path]:
@@ -133,8 +172,10 @@ def load_variants(out_dir: Path, strategies: list[str]) -> list[Variant]:
         if not path.exists():
             raise SystemExit(f"{path} does not exist: run `start` first")
         config = yaml.safe_load(path.read_text())
-        host = config["pipeline"]["workers"]["hosts"][0]
-        variants.append(Variant(strategy, host, STEPS[strategy], config))
+        host, *helpers = config["pipeline"]["workers"]["hosts"]
+        variants.append(
+            Variant(strategy, host, STEPS[strategy], config, tuple(helpers))
+        )
     return variants
 
 
@@ -163,6 +204,34 @@ def allocate(
     return results
 
 
+def add_helpers(
+    placed: list[Variant],
+    spares: list[str],
+    starter: Callable[[Variant, str], str],
+    report: Callable[[str, str], None] = lambda host, outcome: None,
+    limit: int | None = None,
+) -> dict[str, list[str]]:
+    """Let the spare hosts help the runs that have a host, most expensive run
+    first, taking turns. A helper runs the same config next to the run's own
+    worker: they share the work through lock files, so each item (patient, slide)
+    is done once, by whoever gets there first. A host that fails is skipped. At
+    most `limit` helpers are started (None: as many as there are spare hosts).
+    Returns strategy -> helper hosts."""
+    ranked = sorted(placed, key=lambda v: COST_ORDER.index(v.strategy))
+    helpers: dict[str, list[str]] = {v.strategy: [] for v in ranked}
+    for host in spares:
+        n_helpers = sum(map(len, helpers.values()))
+        if not ranked or (limit is not None and n_helpers >= limit):
+            break
+        target = ranked[n_helpers % len(ranked)]
+        outcome = starter(target, host)
+        if is_failure(outcome):
+            report(host, outcome)
+        else:
+            helpers[target.strategy].append(host)
+    return helpers
+
+
 def is_failure(outcome: str) -> bool:
     return outcome.startswith("failed")
 
@@ -174,7 +243,12 @@ def remote_run(variant: Variant, config_file: Path) -> RemoteRun:
     workers = variant.config["pipeline"]["workers"]
     return RemoteRun(
         config_file=config_file,
-        output_dir=Path(variant.config["preprocessing"]["output_dir"]).resolve(),
+        # the run's own folder: its logs and the worker's session name come from it
+        output_dir=(
+            Path(variant.config["preprocessing"]["output_dir"])
+            / variant.config["pipeline"]["experiment"]
+            / variant.config["pipeline"]["run"]
+        ).resolve(),
         workers=WorkersConfig(**workers),
         project_dir=workers.get("project_dir") or str(Path.cwd()),
     )
@@ -204,7 +278,7 @@ def check_hosts(hosts: list[str]) -> dict[str, str | None]:
 def parallel[T, R](function: Callable[[T], R], items: list[T]) -> list[R]:
     if not items:
         return []
-    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(items), 32)) as pool:
         return list(pool.map(function, items))
 
 
@@ -236,6 +310,47 @@ def print_plan(variants: list[Variant], out_dir: Path) -> None:
         print(f"  {variant.strategy:<13} {variant.host:<12} steps: {variant.steps}")
 
 
+def host_report(pool: list[str], problems: dict[str, str | None]) -> list[str]:
+    """Lines saying which pool hosts work without a password and why the others
+    don't, with what to do about each group."""
+    groups: dict[str, list[str]] = {
+        "works": [],
+        "no such host": [],
+        "host key changed": [],
+        "needs a password": [],
+        "other": [],
+    }
+    for host in pool:
+        why = problems[host]
+        if why is None:
+            groups["works"].append(host)
+        elif "resolve" in why.lower():
+            groups["no such host"].append(host)
+        elif "host key verification failed" in why.lower():
+            groups["host key changed"].append(host)
+        elif "permission denied" in why.lower():
+            groups["needs a password"].append(host)
+        else:
+            groups["other"].append(host)
+    advice = {
+        "no such host": "remove from the pool",
+        "host key changed": "the machine may have been reinstalled: once you are sure, "
+        "`ssh-keygen -R <host>`",
+        "needs a password": "start with --no-prompt skips them; to use them, once "
+        "per host: ssh-copy-id -i ~/.ssh/id_ed25519.pub <host>",
+        "other": "unreachable or slow",
+    }
+    lines = [f"{len(pool)} hosts in the pool:"]
+    for name, hosts in groups.items():
+        if not hosts:
+            continue
+        lines.append(f"  {name}: {len(hosts)}")
+        if name in advice:
+            lines.append(f"      ({advice[name]})")
+        lines.append("      " + " ".join(hosts))
+    return lines
+
+
 def explain_problems(problems: dict[str, str | None]) -> None:
     broken = {host: why for host, why in problems.items() if why}
     if not broken:
@@ -253,7 +368,7 @@ def main() -> None:
     parser.add_argument("base_config", type=Path)
     parser.add_argument(
         "action",
-        choices=["configs", "start", "status", "stop"],
+        choices=["hosts", "configs", "start", "status", "stop"],
         default="configs",
     )
     parser.add_argument("--n-tiles", type=int, default=1024)
@@ -261,6 +376,22 @@ def main() -> None:
     parser.add_argument("--hosts", nargs="+", help="the pool (default: from config)")
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--force", action="store_true", help="stop: kill immediately")
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="start: use only hosts that accept a passwordless login (checked in "
+        "parallel first) and never ask for a password",
+    )
+    parser.add_argument(
+        "--max-hosts",
+        type=int,
+        help="start: use at most this many hosts in total (runs plus helpers)",
+    )
+    parser.add_argument(
+        "--no-helpers",
+        action="store_true",
+        help="start: leave spare pool hosts idle instead of helping the heaviest runs",
+    )
     parser.add_argument("--no-progress", action="store_true", help="skip progress")
     args = parser.parse_args()
 
@@ -269,16 +400,31 @@ def main() -> None:
     if not pool:
         raise SystemExit("the config needs pipeline.workers.hosts (or pass --hosts)")
     out_dir = (
-        args.out_dir or Path("configs/sweeps") / f"sampling_{args.n_tiles}"
+        args.out_dir
+        or Path("configs/sweeps") / base.get("pipeline", {}).get("experiment", "sweep")
     ).resolve()
 
     match args.action:
+        case "hosts":
+            print("\n".join(host_report(pool, check_hosts(pool))))
+
         case "configs":
             variants = plan_variants(base, args.strategies, args.n_tiles, pool)
             write_configs(variants, out_dir)
             print_plan(variants, out_dir)
 
         case "start":
+            if args.no_prompt:
+                problems = check_hosts(pool)
+                skipped = [h for h in pool if problems[h]]
+                pool = [h for h in pool if not problems[h]]
+                print(
+                    f"{len(pool)} of {len(skipped) + len(pool)} hosts accept a "
+                    "passwordless login; the rest are skipped "
+                    "(`hosts` action lists them)"
+                )
+                if not pool:
+                    raise SystemExit("no host accepts a passwordless login")
             variants = plan_variants(base, args.strategies, args.n_tiles, pool)
             print(f"{len(variants)} strategies, {len(pool)} hosts in the pool")
             paths: dict[str, Path] = {}
@@ -287,15 +433,12 @@ def main() -> None:
                 path = paths[variant.strategy] = write_configs([variant], out_dir)[
                     variant.strategy
                 ]
-                print(
-                    f"{variant.strategy}: trying {variant.host} "
-                    "(password if asked, Enter to skip this host)"
-                )
+                print(f"{variant.strategy}: trying {variant.host}")
                 return start(
                     remote_run(variant, path),
                     [variant.host],
                     ["--steps", variant.steps],
-                    interactive=True,
+                    interactive=not args.no_prompt,
                 )[variant.host]
 
             def report(variant: Variant, outcome: str) -> None:
@@ -308,6 +451,41 @@ def main() -> None:
 
             left = [v.strategy for v, outcome in results if is_failure(outcome)]
             started = [v for v, outcome in results if not is_failure(outcome)]
+
+            tried = {v.host for v, _ in results}
+            spares = [] if args.no_helpers else [h for h in pool if h not in tried]
+            if spares and started and not left:
+                print(f"\n{len(spares)} spare hosts will help the heaviest runs")
+
+                def helper_starter(variant: Variant, host: str) -> str:
+                    print(f"  {host} -> {variant.strategy}")
+                    return start(
+                        remote_run(variant, paths[variant.strategy]),
+                        [host],
+                        ["--steps", variant.steps],
+                        interactive=not args.no_prompt,
+                    )[host]
+
+                helpers = add_helpers(
+                    started,
+                    spares,
+                    helper_starter,
+                    lambda host, outcome: print(
+                        f"  {host} failed ({outcome}); skipped"
+                    ),
+                    limit=(
+                        None
+                        if args.max_hosts is None
+                        else max(0, args.max_hosts - len(started))
+                    ),
+                )
+                for variant in started:
+                    extra = helpers[variant.strategy]
+                    if extra:
+                        paths[variant.strategy] = write_configs(
+                            [with_helpers(variant, extra)], out_dir
+                        )[variant.strategy]
+                        print(f"{variant.strategy:<13} + {', '.join(extra)}")
             if started:
                 first = remote_run(started[0], paths[started[0].strategy])
                 print(f"\nlogs: {first.log_file('<host>')}")
@@ -323,35 +501,38 @@ def main() -> None:
 
         case "status" | "stop":
             variants = load_variants(out_dir, args.strategies)
-            problems = check_hosts(sorted({v.host for v in variants}))
+            pairs = [(v, host) for v in variants for host in v.hosts]
+            problems = check_hosts(sorted({host for _, host in pairs}))
             explain_problems(problems)
-            reachable = [v for v in variants if not problems[v.host]]
+            reachable = [(v, host) for v, host in pairs if not problems[host]]
             runs = {
                 v.strategy: remote_run(v, config_path(out_dir, v.strategy))
                 for v in variants
             }
             if args.action == "stop":
                 outcomes = parallel(
-                    lambda v: stop(runs[v.strategy], [v.host], force=args.force)[
-                        v.host
-                    ],
+                    lambda pair: stop(
+                        runs[pair[0].strategy], [pair[1]], force=args.force
+                    )[pair[1]],
                     reachable,
                 )
             else:
                 outcomes = parallel(
-                    lambda v: (
+                    lambda pair: (
                         "worker "
-                        + host_states(runs[v.strategy], [v.host])[v.host].value
+                        + host_states(runs[pair[0].strategy], [pair[1]])[pair[1]].value
                     ),
                     reachable,
                 )
             result_of = {
-                v.strategy: o for v, o in zip(reachable, outcomes, strict=True)
+                (variant.strategy, host): outcome
+                for (variant, host), outcome in zip(reachable, outcomes, strict=True)
             }
             print()
-            for variant in variants:
-                outcome = result_of.get(variant.strategy, "unreachable")
-                print(f"{variant.strategy:<13} {variant.host:<12} {outcome}")
+            for variant, host in pairs:
+                outcome = result_of.get((variant.strategy, host), "unreachable")
+                role = "" if host == variant.host else " (helper)"
+                print(f"{variant.strategy:<13} {host:<12} {outcome}{role}")
             if args.action == "status" and not args.no_progress:
                 show_progress(variants)
 

@@ -1,6 +1,8 @@
 """Entry points: run the pipeline's steps, or report how far they have got."""
 
 import logging
+import random
+import time
 from collections.abc import Sequence
 
 from stamp.distributed.progress import StepProgress, step_progress
@@ -20,7 +22,7 @@ from stamp.preprocessing.pipeline.plan import (
     build_plan,
     encoding_possible,
     layout_for,
-    record_run_config,
+    prepare_run,
 )
 
 _logger = logging.getLogger("stamp")
@@ -66,7 +68,7 @@ def run_pipeline_(
             f"a patient has {max_slides} slides, more than encoding.max_slides "
             f"= {limit}"
         )
-    record_run_config(pre, cfg, steps)
+    prepare_run(pre, cfg)
     plan = build_plan(pre, cfg, patients, models or ModelLoaders.from_config(pre, cfg))
     _logger.info(
         f"pipeline: {len(patients)} patients, order {cfg.order}, "
@@ -90,6 +92,9 @@ def run_pipeline_worker(
     """`stamp worker`: the pipeline as one of several workers. Returns an exit code."""
 
     def job() -> bool:
+        # Workers started together would otherwise all create the same folders and
+        # claim the same first item in the same moment.
+        time.sleep(random.uniform(0, 3))
         reports = run_pipeline_(pre, cfg, steps)
         return all(report.ok for report in reports.values())
 

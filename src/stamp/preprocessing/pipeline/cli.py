@@ -7,6 +7,7 @@ from stamp.distributed.progress import format_progress
 from stamp.distributed.remote import RemoteRun, host_states, start, stop
 from stamp.preprocessing.config import PreprocessingConfig
 from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
+from stamp.preprocessing.pipeline.plan import layout_for
 from stamp.preprocessing.pipeline.run import pipeline_progress
 
 WorkersAction = Literal["start", "status", "stop"]
@@ -28,7 +29,7 @@ def workers_command(
         )
     run = RemoteRun(
         config_file=config_file.resolve(),
-        output_dir=pre.output_dir.resolve(),
+        output_dir=layout_for(pre, cfg).run_dir.resolve(),
         workers=cfg.workers,
         project_dir=cfg.workers.project_dir or str(Path.cwd()),
     )

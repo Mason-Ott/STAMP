@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from stamp.preprocessing.data.bags import Bag, read_bag
-from stamp.preprocessing.pipeline.config import StepName
+from stamp.preprocessing.pipeline.config import PipelineConfig, StepName
 from stamp.preprocessing.pipeline.plan import active_steps, layout_for
 from stamp.preprocessing.pipeline.run import run_pipeline_
 
@@ -351,59 +351,77 @@ def folder_contents(root: Path) -> dict[str, int]:
 
 
 def folder_names(pre, cfg) -> list[str]:
+    """Each stage's folder, relative to the experiment folder."""
     layout = layout_for(pre, cfg)
-    return [str(s.folder.relative_to(layout.root)) for s in layout.stages]
+    return [str(s.folder.relative_to(layout.experiment_dir)) for s in layout.stages]
 
 
-def test_stage_folders_are_named_by_the_settings_behind_them(make_configs):
+def test_results_are_organised_by_experiment_and_run(make_configs):
     pre, cfg = make_configs(
-        "ste", encoder="titan", extractor="conch1_5", sampling={"n_tiles": 50}
+        "ste",
+        experiment="exp1",
+        encoder="titan",
+        extractor="conch1_5",
+        sampling={"n_tiles": 50},
     )
+    layout = layout_for(pre, cfg)
+    assert layout.experiment_dir == pre.output_dir / "exp1"
+    assert layout.run_dir == pre.output_dir / "exp1" / "conch1_5-first_n-50"
     names = folder_names(pre, cfg)
-    assert names[0].startswith("tile_positions/") and names[0].count("um_") == 1
-    assert names[1].startswith("patient_positions/") and names[1].endswith("_gap1")
-    assert names[2].startswith("sampled_positions/") and names[2].endswith(
-        "/first_n-50"
-    )
-    assert names[3].startswith("features/conch1_5/") and names[3].endswith(
-        "/first_n-50"
-    )
-    assert names[4].startswith("embeddings/titan/conch1_5/")
+    run = "conch1_5-first_n-50"
+    assert names[0].startswith("shared/tile_positions/")
+    assert names[1].startswith("shared/patient_positions/")
+    assert names[2:] == [
+        f"{run}/sampled_positions",
+        f"{run}/features",
+        f"{run}/embeddings/titan",
+    ]
+    assert layout.logs == layout.run_dir / "logs"
+    assert layout.sampling_overviews == layout.run_dir / "overviews"
 
     pre, cfg = make_configs(
         "ets",
+        experiment="exp1",
+        run="my_run",
+        order="extract_then_sample",
         encoder="titan",
         extractor="conch1_5",
-        order="extract_then_sample",
         sampling={"n_tiles": 50},
     )
     other = folder_names(pre, cfg)
-    assert other[1].startswith("slide_features/conch1_5/")
-    assert other[2].startswith("patient_features/conch1_5/")
-    assert other[3].startswith("features/conch1_5/") and other[3] == names[3]
-    assert other[4] == names[4], "both orders end in the same folders"
+    assert other[0].startswith("shared/tile_positions/")
+    assert other[1].startswith("shared/slide_features/conch1_5/")
+    assert other[2].startswith("shared/patient_features/conch1_5/")
+    assert other[3:] == ["my_run/features", "my_run/embeddings/titan"]
 
 
-def test_settings_that_shape_the_results_change_the_folders(make_configs):
+def test_settings_decide_whether_work_is_shared_or_per_run(make_configs):
     base_pre, base_cfg = make_configs("x", sampling={"n_tiles": 50})
     base = folder_names(base_pre, base_cfg)
+    shared, run = base[:2], base[2:]
 
     pre, cfg = make_configs("x", sampling={"n_tiles": 60})
     other = folder_names(pre, cfg)
-    assert other[:2] == base[:2], "tiles and patients are shared"
-    assert other[2:] != base[2:]
+    assert other[:2] == shared, "sampling doesn't change the shared work"
+    assert other[2:] != run, "a new run folder"
 
     pre, cfg = make_configs("x", sampling={"n_tiles": 50}, virtual_gap_tiles=2)
     other = folder_names(pre, cfg)
-    assert other[0] == base[0] and other[1:] != base[1:]
+    assert other[0] == shared[0] and other[1] != shared[1]
 
     pre, cfg = make_configs("x", sampling={"n_tiles": 50}, drop_edge_tiles=False)
-    assert not set(folder_names(pre, cfg)) & set(base)
+    assert set(folder_names(pre, cfg)[:2]).isdisjoint(shared)
 
     pre = base_pre.model_copy(update={"extractor": "conch1_5"})
     other = folder_names(pre, base_cfg)
-    assert other[:3] == base[:3], "positions don't depend on the extractor"
-    assert other[3] != base[3]
+    assert other[:2] == shared, "positions don't depend on the extractor"
+    assert other[2:] != run
+
+    pre, cfg = make_configs("x", sampling={"n_tiles": 50}, experiment="other")
+    assert (
+        layout_for(pre, cfg).experiment_dir
+        != layout_for(base_pre, base_cfg).experiment_dir
+    )
 
 
 def test_only_the_results_remain_without_keep_intermediates(make_configs, fake_models):
@@ -427,103 +445,134 @@ def test_only_the_results_remain_without_keep_intermediates(make_configs, fake_m
 
 def test_intermediates_are_kept_by_default(make_configs, fake_models):
     pre, cfg = run(make_configs, fake_models, "kept")
-    assert sorted(folder_contents(pre.output_dir).values()) == [3, 3, 3, 5]
-    assert {n.split("/")[0] for n in folder_contents(pre.output_dir)} == {
-        "tile_positions",
-        "patient_positions",
-        "sampled_positions",
-        "features",
+    layout = layout_for(pre, cfg)
+    folders = {
+        Path(k).parts[-1]: v for k, v in folder_contents(layout.experiment_dir).items()
     }
+    assert folders["sampled_positions"] == folders["features"] == 3
+    assert sorted(folder_contents(layout.experiment_dir).values()) == [3, 3, 3, 5]
+    assert len(list(layout.shared_dir.rglob("*.h5"))) == 8, "tiles and patients"
 
 
-def test_runs_with_other_settings_share_one_output_dir(make_configs, fake_models):
-    pre, cfg = run(make_configs, fake_models, "multi", sampling={"n_tiles": 50})
-    first = layout_for(pre, cfg).training_bags
-    first_bags = read_folder(first)
+def test_runs_of_one_experiment_share_work_but_keep_their_results_apart(
+    make_configs, fake_models
+):
+    pre, cfg = run(
+        make_configs, fake_models, "multi", run="a", sampling={"n_tiles": 50}
+    )
+    first = layout_for(pre, cfg)
+    first_bags = read_folder(first.training_bags)
 
-    # Other sampling settings: new sampled and feature folders, nothing re-tiled.
+    # Another run: new run folder, but nothing re-tiled or re-combined.
     other_cfg = cfg.model_copy(
-        update={"sampling": cfg.sampling.model_copy(update={"n_tiles": 20})}
+        update={
+            "run": "b",
+            "sampling": cfg.sampling.model_copy(update={"n_tiles": 20}),
+        }
     )
     reports = run_pipeline_(pre, other_cfg, models=fake_models)
     assert not any(r.failed for r in reports.values())
     assert reports[StepName.TILE].done == 0 and reports[StepName.COMBINE].done == 0
     assert reports[StepName.SAMPLE].done == 3 and reports[StepName.EXTRACT].done == 3
-    second = layout_for(pre, other_cfg).training_bags
-    assert second != first
-    assert all(len(b) <= 20 for b in read_folder(second).values())
-    assert read_folder(first).keys() == first_bags.keys(), "first run untouched"
+    second = layout_for(pre, other_cfg)
+    assert second.run_dir != first.run_dir
+    assert second.stage(StepName.TILE).folder == first.stage(StepName.TILE).folder
+    assert all(len(b) <= 20 for b in read_folder(second.training_bags).values())
+    assert read_folder(first.training_bags).keys() == first_bags.keys()
+    assert all(len(b) <= 50 for b in read_folder(first.training_bags).values())
 
-    # The other order ends in the same folder, which is already done.
-    swapped = other_cfg.model_copy(update={"order": "extract_then_sample"})
-    assert layout_for(pre, swapped).training_bags == second
-    reports = run_pipeline_(pre, swapped, models=fake_models)
-    assert reports[StepName.SAMPLE].done == 0 and reports[StepName.SAMPLE].ok
-
-    # Another extractor: same positions, new features.
+    # Another extractor in the same experiment: the shared positions are reused.
     other_pre = pre.model_copy(update={"extractor": "conch1_5"})
-    reports = run_pipeline_(other_pre, cfg, models=fake_models)
-    assert reports[StepName.SAMPLE].done == 0 and reports[StepName.EXTRACT].done == 3
-    assert layout_for(other_pre, cfg).training_bags != first
+    third_cfg = cfg.model_copy(update={"run": "c"})
+    reports = run_pipeline_(other_pre, third_cfg, models=fake_models)
+    assert reports[StepName.TILE].done == 0 and reports[StepName.EXTRACT].done == 3
 
 
-def test_the_configuration_is_recorded_next_to_the_results(make_configs, fake_models):
+def test_each_run_has_its_config_and_a_guide(make_configs, fake_models):
     import yaml
 
     pre, cfg = run(
-        make_configs, fake_models, "recorded", encoder="titan", extractor="conch1_5"
+        make_configs,
+        fake_models,
+        "recorded",
+        run="first_run",
+        encoder="titan",
+        extractor="conch1_5",
     )
     layout = layout_for(pre, cfg)
-    sampled = layout.stage(StepName.SAMPLE).folder
-    for folder in (sampled, layout.training_bags, layout.embeddings):
-        recorded = yaml.safe_load((folder / "config.yaml").read_text())
-        assert recorded["pipeline"]["sampling"]["n_tiles"] == cfg.sampling.n_tiles
-        assert recorded["pipeline"]["sampling"]["seed"] == 0
-        assert recorded["pipeline"]["encoder"] == "titan"
-        assert recorded["preprocessing"]["extractor"] == "conch1_5"
-        assert "workers" not in recorded["pipeline"]
-    # tiling and patient folders are shared by runs with any sampling
-    for step in (StepName.TILE, StepName.COMBINE):
-        assert not (layout.stage(step).folder / "config.yaml").exists()
+    recorded = yaml.safe_load((layout.run_dir / "config.yaml").read_text())
+    assert recorded["pipeline"]["sampling"]["n_tiles"] == cfg.sampling.n_tiles
+    assert recorded["pipeline"]["sampling"]["seed"] == 0
+    assert recorded["pipeline"]["encoder"] == "titan"
+    assert recorded["pipeline"]["run"] == "first_run"
+    assert recorded["preprocessing"]["extractor"] == "conch1_5"
+    assert "workers" not in recorded["pipeline"]
+
+    guide = (layout.run_dir / "README.md").read_text()
+    assert "Run `first_run` of experiment `test`" in guide
+    positions = [guide.index(f". {s.step}:") for s in layout.stages]
+    assert positions == sorted(positions), "steps in order"
+    assert "../shared/tile_positions/" in guide and "embeddings/titan/" in guide
+    assert "first_run/" in guide and "config.yaml" in guide
+
+    # a second run joins the experiment's index
+    run_pipeline_(
+        pre,
+        cfg.model_copy(update={"run": "second_run"}),
+        [StepName.TILE, StepName.COMBINE],
+        models=fake_models,
+    )
+    index = (layout.experiment_dir / "README.md").read_text()
+    assert "first_run" in index and "second_run" in index and "first_n" in index
 
 
-def test_sampling_only_runs_record_their_configuration_too(make_configs, fake_models):
+def test_sampling_only_runs_have_their_config_and_overviews(make_configs, fake_models):
     pre, cfg = make_configs("sampling_only", sampling={"n_tiles": 20})
     pre = pre.model_copy(update={"save_visualisations": True})
     steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE]
     run_pipeline_(pre, cfg, steps, models=fake_models)
     layout = layout_for(pre, cfg)
-    assert (layout.stage(StepName.SAMPLE).folder / "config.yaml").exists()
-    assert (layout.sampling_overviews / "config.yaml").exists()
+    assert (layout.run_dir / "config.yaml").exists()
+    assert (layout.run_dir / "README.md").exists()
+    assert list(layout.sampling_overviews.glob("*.png"))
     assert not layout.training_bags.exists()
 
 
-def test_the_seed_is_recorded_but_not_in_the_folder_name(make_configs, fake_models):
-    import yaml
-
+def test_a_run_folder_rejects_other_result_shaping_settings(make_configs, fake_models):
     seeded = {"strategy": "random", "n_tiles": 20, "seed": 5}
-    pre, cfg = make_configs("seeded", sampling=seeded)
-    assert "seed" not in layout_for(pre, cfg).training_bags.name
+    pre, cfg = make_configs("seeded", run="r", sampling=seeded)
     steps = [StepName.TILE, StepName.COMBINE, StepName.SAMPLE]
     run_pipeline_(pre, cfg, steps, models=fake_models)
-    folder = layout_for(pre, cfg).stage(StepName.SAMPLE).folder
-    assert (
-        yaml.safe_load((folder / "config.yaml").read_text())["pipeline"]["sampling"][
-            "seed"
-        ]
-        == 5
-    )
 
-    # The same folder with another seed would mix up two different samples.
     other = cfg.model_copy(
         update={"sampling": cfg.sampling.model_copy(update={"seed": 6})}
     )
-    assert layout_for(pre, other).stage(StepName.SAMPLE).folder == folder
-    with pytest.raises(ValueError, match="different sampling settings.*seed: 5 -> 6"):
+    assert layout_for(pre, other).run_dir == layout_for(pre, cfg).run_dir
+    with pytest.raises(ValueError, match="different settings.*sampling.seed: 5 -> 6"):
         run_pipeline_(pre, other, steps, models=fake_models)
-    # ...and rerunning with the same seed is fine.
+    # nothing was changed by the rejected run
+    import yaml
+
+    recorded = yaml.safe_load(
+        (layout_for(pre, cfg).run_dir / "config.yaml").read_text()
+    )
+    assert recorded["pipeline"]["sampling"]["seed"] == 5
+
+    # the same settings again are fine, and so is adding an encoder later
     reports = run_pipeline_(pre, cfg, steps, models=fake_models)
     assert all(r.ok and r.done == 0 for r in reports.values())
+    with_encoder = cfg.model_copy(update={"encoder": "titan"})
+    run_pipeline_(pre, with_encoder, steps, models=fake_models)
+
+
+def test_experiment_and_run_names_are_validated(make_configs):
+    for bad in ("", "has space", "../escape", ".hidden", "shared"):
+        with pytest.raises(ValueError, match="pipeline.(experiment|run)"):
+            make_configs("x", experiment=bad)
+        with pytest.raises(ValueError, match="pipeline.(experiment|run)"):
+            make_configs("x", run=bad)
+    with pytest.raises(ValueError, match="experiment"):
+        PipelineConfig.model_validate({"clinical_table": "c.csv"})
 
 
 def test_failed_stage_keeps_its_input_for_recovery(
@@ -618,6 +667,8 @@ def test_tissue_sampling_keeps_the_tiles_with_the_least_background(
             assert min(score[c] for c in kept) >= max(dropped), (key, slide.slide_id)
     assert checked, "the test needs a slide with more tiles than its quota"
     reader.close()
+
+
 def test_chunked_encoding_averages_chunk_embeddings_of_all_tiles(
     make_configs, fake_models
 ):
@@ -715,7 +766,7 @@ def test_per_slide_embeddings_are_aggregated(make_configs, fake_models):
         make_configs, fake_models, "slides", slide_aggregation="mean"
     )
     layout = layout_for(pre, cfg)
-    assert layout.stage(StepName.ENCODE).folder.parts[-5] == "slide_embeddings"
+    assert layout.stage(StepName.ENCODE).folder.parts[-2] == "slide_embeddings"
     assert layout.embeddings.name == "slides_mean"
 
     calls = fake_models.encoder.get().calls
@@ -840,3 +891,69 @@ def test_per_slide_encoding_with_chunks_averages_chunks_within_each_slide(
         len(b.distinct_tiles()[0]) for b in bags.values()
     )
     assert len(calls) > sum(SLIDE_COUNTS.values()), "some slides needed chunks"
+
+
+class DamagedSlide:
+    """A slide whose coarse layers can't be read, like a partly corrupt scan."""
+
+    level_count = 3
+    level_dimensions = ((4096, 3072), (1024, 768), (256, 192))
+    level_downsamples = (1.0, 4.0, 16.0)
+    readable = (0, 1)
+
+    def get_thumbnail(self, size):
+        from openslide import OpenSlideError
+
+        raise OpenSlideError("Not a JPEG file: starts with 0x11 0x00")
+
+    def read_region(self, location, level, size):
+        from openslide import OpenSlideError
+        from PIL import Image
+
+        if level not in self.readable:
+            raise OpenSlideError("Not a JPEG file: starts with 0x11 0x00")
+        return Image.new("RGBA", size, (200, 30, 30, 255))
+
+    def close(self):
+        pass
+
+
+def test_thumbnail_of_a_slide_with_damaged_layers_comes_from_a_readable_one(
+    monkeypatch,
+):
+    from stamp.preprocessing.slides import overview
+
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: DamagedSlide())
+    thumbnail = overview._thumbnail_from_readable_level("any.svs", 512)
+    assert thumbnail.size == (512, 384), "aspect ratio kept, fitted to 512"
+    red = np.asarray(thumbnail)[..., 0]
+    assert red.min() > 150, "filled from layer 1 (the coarsest that reads)"
+
+
+def test_a_piece_that_cannot_be_read_stays_white(monkeypatch):
+    from openslide import OpenSlideError
+
+    from stamp.preprocessing.slides import overview
+
+    class OneBadPiece(DamagedSlide):
+        def read_region(self, location, level, size):
+            if level == 1 and location[0] == 0:
+                raise OpenSlideError("bad tile")
+            return super().read_region(location, level, size)
+
+    monkeypatch.setattr(overview, "CHUNK_PX", 512)
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: OneBadPiece())
+    # probing level 1 hits the bad piece at (0, 0), so it falls back to level 0
+    thumbnail = overview._thumbnail_from_readable_level("any.svs", 512)
+    assert thumbnail.size == (512, 384)
+
+
+def test_a_slide_with_no_readable_layer_is_an_error(monkeypatch):
+    from stamp.preprocessing.slides import overview
+
+    class Unreadable(DamagedSlide):
+        readable = ()
+
+    monkeypatch.setattr(overview.openslide, "open_slide", lambda path: Unreadable())
+    with pytest.raises(RuntimeError, match="no layer"):
+        overview._thumbnail_from_readable_level("any.svs", 512)

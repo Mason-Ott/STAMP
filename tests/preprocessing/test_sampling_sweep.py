@@ -23,6 +23,7 @@ BASE = {
         "save_visualisations": False,
     },
     "pipeline": {
+        "experiment": "sweep",
         "clinical_table": "/clinical.csv",
         "order": "extract_then_sample",
         "sampling": {"n_tiles": 8192, "strategy": "first_n", "pad_mode": "repeat"},
@@ -173,3 +174,258 @@ def test_status_and_stop_use_the_hosts_written_by_start(tmp_path):
     ]
     with pytest.raises(SystemExit, match="run `start` first"):
         sweep.load_variants(tmp_path, ["tissue"])
+
+
+def test_a_sweep_is_one_experiment_with_a_run_per_strategy(tmp_path):
+    variants = sweep.plan_variants(BASE, ["entropy", "random"], 1024)
+    for variant in variants:
+        pipeline = variant.config["pipeline"]
+        assert pipeline["experiment"] == "sweep"
+        assert pipeline["run"] == variant.strategy
+        run = sweep.remote_run(variant, tmp_path / f"{variant.strategy}.yaml")
+        # logs and the worker's session name come from the run's own folder
+        assert run.output_dir == Path("/out/sweep") / variant.strategy
+        assert run.log_file("h1") == run.output_dir / "logs" / "h1.log"
+    sessions = {
+        sweep.remote_run(v, tmp_path / f"{v.strategy}.yaml").session for v in variants
+    }
+    assert len(sessions) == 2
+
+
+def test_the_sweep_needs_an_experiment_name():
+    pipeline = {k: v for k, v in BASE["pipeline"].items() if k != "experiment"}
+    with pytest.raises(ValueError, match="pipeline.experiment"):
+        sweep.plan_variants({**BASE, "pipeline": pipeline}, ["entropy"], 1024)
+
+
+def test_sweep_workers_check_for_each_other_often():
+    for variant in sweep.plan_variants(BASE, ["entropy"], 1024):
+        assert variant.config["pipeline"]["coordination"]["poll_interval_s"] == 5.0
+    slow = {
+        **BASE,
+        "pipeline": {**BASE["pipeline"], "coordination": {"poll_interval_s": 60}},
+    }
+    variant = sweep.plan_variants(slow, ["entropy"], 1024)[0]
+    assert variant.config["pipeline"]["coordination"]["poll_interval_s"] == 60, (
+        "an explicit setting is kept"
+    )
+
+
+def test_spare_hosts_help_the_most_expensive_runs_in_turn():
+    variants = sweep.plan_variants(
+        BASE, ["first_n", "conch_kmeans", "texture"], 1024, ["h1", "h2", "h3"]
+    )
+    started = []
+
+    def starter(variant, host):
+        started.append((variant.strategy, host))
+        return "started"
+
+    helpers = sweep.add_helpers(variants, ["s1", "s2", "s3", "s4", "s5"], starter)
+    # heaviest first: conch_kmeans, texture, first_n, then around again
+    assert started == [
+        ("conch_kmeans", "s1"),
+        ("texture", "s2"),
+        ("first_n", "s3"),
+        ("conch_kmeans", "s4"),
+        ("texture", "s5"),
+    ]
+    assert helpers == {
+        "conch_kmeans": ["s1", "s4"],
+        "texture": ["s2", "s5"],
+        "first_n": ["s3"],
+    }
+
+
+def test_a_failing_spare_is_skipped_and_the_turn_is_not_lost():
+    variants = sweep.plan_variants(
+        BASE, ["conch_kmeans", "texture"], 1024, ["h1", "h2"]
+    )
+    reported = []
+    helpers = sweep.add_helpers(
+        variants,
+        ["bad", "ok1", "ok2"],
+        lambda variant, host: "failed: down" if host == "bad" else "started",
+        lambda host, outcome: reported.append(host),
+    )
+    assert reported == ["bad"]
+    assert helpers == {"conch_kmeans": ["ok1"], "texture": ["ok2"]}
+
+
+def test_no_spares_or_no_runs_means_no_helpers():
+    variants = sweep.plan_variants(BASE, ["entropy"], 1024, ["h1"])
+    assert sweep.add_helpers(variants, [], lambda v, h: "started") == {"entropy": []}
+    assert sweep.add_helpers([], ["s1"], lambda v, h: "started") == {}
+
+
+def test_helpers_are_recorded_in_the_config_for_status_and_stop(tmp_path):
+    variant = sweep.plan_variants(BASE, ["texture"], 1024, ["h1"])[0]
+    helped = sweep.with_helpers(variant, ["s1", "s2"])
+    assert helped.hosts == ["h1", "s1", "s2"]
+    sweep.write_configs([helped], tmp_path)
+    loaded = sweep.load_variants(tmp_path, ["texture"])[0]
+    assert (loaded.host, loaded.helpers) == ("h1", ("s1", "s2"))
+    assert loaded.config["pipeline"]["workers"]["hosts"] == ["h1", "s1", "s2"]
+    # moving the run to another host drops the old helpers
+    assert sweep.with_host(helped, "h9").hosts == ["h9"]
+
+
+def run_main(monkeypatch, capsys, *argv):
+    monkeypatch.setattr("sys.argv", ["sampling_sweep.py", *argv])
+    sweep.main()
+    return capsys.readouterr().out
+
+
+def test_status_and_stop_run_end_to_end_with_helpers(tmp_path, monkeypatch, capsys):
+    from stamp.distributed.remote import HostState
+
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+    variants = sweep.plan_variants(BASE, ["entropy", "texture"], 1024, ["h1", "h2"])
+    sweep.write_configs([sweep.with_helpers(variants[0], ["s1"]), variants[1]], out_dir)
+
+    stopped = []
+    monkeypatch.setattr(sweep, "check_hosts", lambda hosts: dict.fromkeys(hosts))
+    monkeypatch.setattr(
+        sweep, "host_states", lambda run, hosts: {hosts[0]: HostState.RUNNING}
+    )
+    monkeypatch.setattr(
+        sweep,
+        "stop",
+        lambda run, hosts, force: stopped.append(hosts[0]) or {hosts[0]: "stopping"},
+    )
+    common = [
+        str(base),
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--out-dir", str(out_dir),
+    ]  # fmt: skip
+
+    status = run_main(
+        monkeypatch, capsys, common[0], "status", *common[1:], "--no-progress"
+    )
+    assert "entropy       h1           worker running" in status
+    assert "entropy       s1           worker running (helper)" in status
+    assert "texture       h2           worker running" in status
+
+    run_main(monkeypatch, capsys, common[0], "stop", *common[1:])
+    assert sorted(stopped) == ["h1", "h2", "s1"], "helpers are stopped too"
+
+
+def test_start_runs_end_to_end_and_records_the_helpers(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+
+    started = []
+
+    def fake_start(run, hosts, worker_args=(), *, interactive=False):
+        host = hosts[0]
+        started.append((run.config_file.stem, host))
+        return {host: "failed: no route" if host == "bad" else "started"}
+
+    monkeypatch.setattr(sweep, "start", fake_start)
+    out = run_main(
+        monkeypatch,
+        capsys,
+        str(base),
+        "start",
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--hosts", "bad", "h1", "h2", "h3", "h4",
+        "--out-dir", str(out_dir),
+    )  # fmt: skip
+    assert "bad failed" in out and "entropy" in out
+    # entropy skipped `bad`; texture got h2; h3 and h4 help the heaviest run first
+    assert ("sampling_entropy", "h1") in started
+    assert ("sampling_texture", "h2") in started
+    loaded = {
+        v.strategy: v for v in sweep.load_variants(out_dir, ["entropy", "texture"])
+    }
+    assert loaded["texture"].hosts == ["h2", "h3"]
+    assert loaded["entropy"].hosts == ["h1", "h4"]
+
+
+def test_helpers_are_capped_by_the_limit():
+    variants = sweep.plan_variants(BASE, ["entropy", "texture"], 1024, ["h1", "h2"])
+    started = []
+
+    def starter(variant, host):
+        started.append(host)
+        return "started"
+
+    helpers = sweep.add_helpers(variants, ["s1", "s2", "s3", "s4"], starter, limit=3)
+    assert started == ["s1", "s2", "s3"] and sum(map(len, helpers.values())) == 3
+    assert sweep.add_helpers(variants, ["s1"], starter, limit=0) == {
+        "entropy": [],
+        "texture": [],
+    }
+
+
+def test_the_host_report_groups_hosts_and_says_what_to_do():
+    problems = {
+        "ok1": None,
+        "gone": "ssh: Could not resolve hostname gone: Name or service not known",
+        "moved": "Host key verification failed.",
+        "pw1": "mot30@pw1: Permission denied (publickey,password).",
+        "pw2": "mot30@pw2: Permission denied (publickey,password).",
+        "slow": "timed out",
+    }
+    text = "\n".join(sweep.host_report(list(problems), problems))
+    assert "6 hosts in the pool" in text
+    assert "works: 1" in text and "needs a password: 2" in text
+    assert "no such host: 1" in text and "host key changed: 1" in text
+    assert "other: 1" in text
+    assert "pw1 pw2" in text and "--no-prompt" in text and "ssh-keygen -R" in text
+
+
+def test_hosts_action_prints_the_report(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    monkeypatch.setattr(
+        sweep,
+        "check_hosts",
+        lambda hosts: {h: None if h == "h1" else "timed out" for h in hosts},
+    )
+    out = run_main(monkeypatch, capsys, str(base), "hosts")
+    assert "works: 1" in out and "other: 2" in out
+
+
+def test_start_without_prompts_uses_only_hosts_that_work(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(BASE))
+    out_dir = tmp_path / "sweep"
+    seen = []
+
+    def fake_start(run, hosts, worker_args=(), *, interactive=False):
+        seen.append((hosts[0], interactive))
+        return {hosts[0]: "started"}
+
+    monkeypatch.setattr(sweep, "start", fake_start)
+    monkeypatch.setattr(
+        sweep,
+        "check_hosts",
+        lambda hosts: {
+            h: None if h in {"w1", "w2", "w3", "w4"} else "Permission denied"
+            for h in hosts
+        },
+    )
+    out = run_main(
+        monkeypatch,
+        capsys,
+        str(base),
+        "start",
+        "--n-tiles", "1024",
+        "--strategies", "entropy", "texture",
+        "--hosts", "p1", "w1", "p2", "w2", "w3", "p3", "w4",
+        "--no-prompt",
+        "--max-hosts", "3",
+        "--out-dir", str(out_dir),
+    )  # fmt: skip
+    assert "4 of 7 hosts accept a passwordless login" in out
+    hosts = [host for host, _ in seen]
+    assert hosts == ["w1", "w2", "w3"], (
+        "two runs plus one helper, no skipped host tried"
+    )
+    assert not any(interactive for _, interactive in seen), "never asks for a password"
