@@ -4,6 +4,10 @@
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml status --n-tiles 1024
     python scripts/sampling_sweep.py configs/crc_pipeline.yaml stop --n-tiles 1024
 
+By default the sweep only samples (positions, thumbnails). `--steps
+tile,combine,sample,extract` also extracts the features of the sampled tiles
+(give the same `--steps` to `status`).
+
 Run it from the STAMP folder, with the environment active.
 
 Actions
@@ -96,10 +100,15 @@ class Variant:
 
 
 def plan_variants(
-    base: dict, strategies: list[str], n_tiles: int, hosts: list[str] | None = None
+    base: dict,
+    strategies: list[str],
+    n_tiles: int,
+    hosts: list[str] | None = None,
+    steps: str | None = None,
 ) -> list[Variant]:
     """One variant per strategy, assigned to `hosts` (default: the config's pool)
-    in turn."""
+    in turn. `steps` (comma separated) replaces the default `STEPS` of every
+    strategy."""
     workers = base.get("pipeline", {}).get("workers")
     if not workers or not (hosts or workers.get("hosts")):
         raise ValueError("the config needs pipeline.workers.hosts (or pass --hosts)")
@@ -130,7 +139,7 @@ def plan_variants(
             "strategy": strategy,
             "n_tiles": n_tiles,
         }
-        variants.append(Variant(strategy, "", STEPS[strategy], config))
+        variants.append(Variant(strategy, "", steps or STEPS[strategy], config))
     return [with_host(v, hosts[i % len(hosts)]) for i, v in enumerate(variants)]
 
 
@@ -164,8 +173,11 @@ def config_path(out_dir: Path, strategy: str) -> Path:
     return out_dir / f"sampling_{strategy}.yaml"
 
 
-def load_variants(out_dir: Path, strategies: list[str]) -> list[Variant]:
-    """The variants as written by `start`/`configs` (with the hosts they got)."""
+def load_variants(
+    out_dir: Path, strategies: list[str], steps: str | None = None
+) -> list[Variant]:
+    """The variants as written by `start`/`configs` (with the hosts they got).
+    Pass the `steps` given to `start` so `status` counts them."""
     variants = []
     for strategy in strategies:
         path = config_path(out_dir, strategy)
@@ -174,7 +186,7 @@ def load_variants(out_dir: Path, strategies: list[str]) -> list[Variant]:
         config = yaml.safe_load(path.read_text())
         host, *helpers = config["pipeline"]["workers"]["hosts"]
         variants.append(
-            Variant(strategy, host, STEPS[strategy], config, tuple(helpers))
+            Variant(strategy, host, steps or STEPS[strategy], config, tuple(helpers))
         )
     return variants
 
@@ -304,6 +316,19 @@ def show_progress(variants: list[Variant]) -> None:
         print(f"  {variant.strategy:<13} " + "   ".join(cells))
 
 
+def parse_steps(text: str) -> str:
+    """Check a `--steps` value: comma separated pipeline step names."""
+    from stamp.preprocessing.pipeline.config import StepName
+
+    names = [name.strip() for name in text.split(",")]
+    unknown = [name for name in names if name not in list(StepName)]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown step(s) {', '.join(unknown)}; choose from {', '.join(StepName)}"
+        )
+    return ",".join(names)
+
+
 def print_plan(variants: list[Variant], out_dir: Path) -> None:
     print(f"configs in {out_dir}")
     for variant in variants:
@@ -374,6 +399,13 @@ def main() -> None:
     parser.add_argument("--n-tiles", type=int, default=1024)
     parser.add_argument("--strategies", nargs="+", default=list(STEPS), choices=STEPS)
     parser.add_argument("--hosts", nargs="+", help="the pool (default: from config)")
+    parser.add_argument(
+        "--steps",
+        type=parse_steps,
+        help="steps to run for every strategy, e.g. tile,combine,sample,extract "
+        "(default: the sampling steps of each strategy, see STEPS). Give the same "
+        "value to status",
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--force", action="store_true", help="stop: kill immediately")
     parser.add_argument(
@@ -409,7 +441,9 @@ def main() -> None:
             print("\n".join(host_report(pool, check_hosts(pool))))
 
         case "configs":
-            variants = plan_variants(base, args.strategies, args.n_tiles, pool)
+            variants = plan_variants(
+                base, args.strategies, args.n_tiles, pool, args.steps
+            )
             write_configs(variants, out_dir)
             print_plan(variants, out_dir)
 
@@ -425,7 +459,9 @@ def main() -> None:
                 )
                 if not pool:
                     raise SystemExit("no host accepts a passwordless login")
-            variants = plan_variants(base, args.strategies, args.n_tiles, pool)
+            variants = plan_variants(
+                base, args.strategies, args.n_tiles, pool, args.steps
+            )
             print(f"{len(variants)} strategies, {len(pool)} hosts in the pool")
             paths: dict[str, Path] = {}
 
@@ -500,7 +536,7 @@ def main() -> None:
                 raise SystemExit(1)
 
         case "status" | "stop":
-            variants = load_variants(out_dir, args.strategies)
+            variants = load_variants(out_dir, args.strategies, args.steps)
             pairs = [(v, host) for v in variants for host in v.hosts]
             problems = check_hosts(sorted({host for _, host in pairs}))
             explain_problems(problems)
