@@ -429,3 +429,54 @@ def test_start_without_prompts_uses_only_hosts_that_work(tmp_path, monkeypatch, 
         "two runs plus one helper, no skipped host tried"
     )
     assert not any(interactive for _, interactive in seen), "never asks for a password"
+
+
+def test_steps_can_be_overridden_and_status_counts_them(
+    tmp_path, monkeypatch, capsys, dataset
+):
+    steps = "tile,combine,sample,extract"
+    default = sweep.plan_variants(BASE, ["random"], 1024)
+    assert default[0].steps == "tile,combine,sample"
+    assert sweep.plan_variants(BASE, ["random"], 1024, steps=steps)[0].steps == steps
+
+    with pytest.raises(Exception, match="unknown step"):
+        sweep.parse_steps("tile,sampel")
+
+    # real paths, so that `status` can read the (still empty) outputs
+    real = yaml.safe_load(yaml.safe_dump(BASE))
+    real["preprocessing"] |= {
+        "output_dir": str(tmp_path / "out"),
+        "wsi_dir": str(dataset.wsi_dir),
+        "cache_dir": str(dataset.cache_dir),
+        "extractor": "ctranspath",
+    }
+    real["pipeline"]["clinical_table"] = str(dataset.clinical_table)
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(real))
+    out_dir = tmp_path / "sweep"
+    started = []
+
+    def fake_start(run, hosts, worker_args=(), *, interactive=False):
+        started.append(list(worker_args))
+        return {hosts[0]: "started"}
+
+    monkeypatch.setattr(sweep, "start", fake_start)
+    common = ["--n-tiles", "1024", "--strategies", "random", "--hosts", "h1",
+              "--out-dir", str(out_dir)]  # fmt: skip
+    run_main(monkeypatch, capsys, str(base), "start", "--steps", steps, *common)
+    assert ["--steps", steps] in [started[0][i : i + 2] for i in range(len(started[0]))]
+    assert sweep.load_variants(out_dir, ["random"], steps)[0].steps == steps
+    assert sweep.load_variants(out_dir, ["random"])[0].steps == "tile,combine,sample"
+    # status with progress reports the extract step too (nothing written yet: 0/..)
+    from stamp.distributed.remote import HostState
+
+    monkeypatch.setattr(sweep, "check_hosts", lambda hosts: dict.fromkeys(hosts))
+    monkeypatch.setattr(
+        sweep, "host_states", lambda run, hosts: {hosts[0]: HostState.RUNNING}
+    )
+    status = run_main(
+        monkeypatch, capsys, str(base), "status", "--steps", steps, *common
+    )
+    assert "extract 0/" in status
+    status = run_main(monkeypatch, capsys, str(base), "status", *common)
+    assert "sample 0/" in status and "extract" not in status
